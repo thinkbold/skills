@@ -1,4 +1,47 @@
 {
   "schema_version": "1.0",
-  "case_id": "synthetic-001"
+  "case_id": "synthetic-001",
+  "jurisdiction": {
+    "country": "CA",
+    "province": "ON"
+  },
+  "housing": {
+    "market_type": "market",
+    "owner_shared_kitchen_or_bathroom": false,
+    "address": "100 Example Street, Toronto, ON",
+    "monthly_rent_cad": "2400.00",
+    "expected_start_date": "2026-09-01",
+    "term_months": 12
+  },
+  "applicants": [
+    {
+      "applicant_id": "applicant-a",
+      "lease_signer": true,
+      "files": [
+        {
+          "path": "inputs/application-a.pdf",
+          "kind": "application"
+        }
+      ]
+    }
+  ],
+  "privacy": {
+    "responsible_person": "Synthetic Manager",
+    "controlled_storage_confirmed": true,
+    "access_correction_process_confirmed": true
+  },
+  "authorizations": {
+    "general": {
+      "version": "counsel-approved-1",
+      "signed_at": "2026-08-01",
+      "open_web_disclosed": true
+    },
+    "social": {
+      "status": "not_requested"
+    }
+  },
+  "decision": {
+    "status": "pending",
+    "legal_hold": false
+  }
 }
