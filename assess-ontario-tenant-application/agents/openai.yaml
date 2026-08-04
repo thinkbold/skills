@@ -1,0 +1,4 @@
+interface:
+  display_name: "Assess Ontario Tenant Application"
+  short_description: "Audit one Ontario rental application evidence package"
+  default_prompt: "Assess the Ontario tenant application case folder provided by the user and produce the English evidence package."
