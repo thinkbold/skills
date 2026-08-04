@@ -1,0 +1,23 @@
+{
+  "core": {"evidence_available": true, "credit_history_available": true, "rental_history_available": true},
+  "core_facts": [],
+  "discrepancies": [],
+  "payment_facts": [],
+  "public_records": [],
+  "public_search_outcomes": [],
+  "accommodation_review_required": false,
+  "financial_input": {
+    "monthly_rent_cad": "1700.00",
+    "exchange_rates": {},
+    "incomes": [{
+      "applicant_id": "applicant-zeta",
+      "amount": "4500",
+      "period": "monthly",
+      "currency": "CAD",
+      "confirmed": true,
+      "recurring": true,
+      "basis": "gross_employment"
+    }],
+    "debts": []
+  }
+}

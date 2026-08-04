@@ -24,6 +24,18 @@ ALLOWED_REASON_CODES = [
     "other_requires_explanation",
 ]
 ASSET_ROOT = Path(__file__).resolve().parents[1] / "assets"
+INTEGRITY_LABELS = {
+    "no_confirmed_issue": "No confirmed issue",
+    "clarification_pending": "Clarification pending",
+    "human_confirmed_material_conflict": "Human-confirmed material conflict",
+    "insufficient_evidence": "Insufficient evidence",
+}
+PAYMENT_LABELS = {
+    "no_current_negative_payment_evidence_found": "No current negative payment evidence found",
+    "negative_payment_evidence_requires_human_review": "Negative payment evidence requires human review",
+    "limited_evidence": "Limited evidence",
+    "unable_to_assess": "Unable to assess",
+}
 
 
 def recommendation_for(
@@ -71,8 +83,8 @@ def _render_assessment(
         "",
         "## Evidence States",
         "",
-        f"- Application integrity: {states.integrity_state}",
-        f"- Rent-payment evidence: {states.payment_state}",
+        f"- Application integrity: {INTEGRITY_LABELS.get(states.integrity_state, states.integrity_state)}",
+        f"- Rent-payment evidence: {PAYMENT_LABELS.get(states.payment_state, states.payment_state)}",
         "",
         "## Confirmed Financial Facts",
         "",
@@ -108,6 +120,18 @@ def _render_assessment(
             "",
         ]
     )
+
+    excluded_income = financials.get("excluded_income_records", [])
+    if excluded_income:
+        lines.extend(["## Excluded Income Records", ""])
+        for record in excluded_income:
+            lines.append(
+                "- Applicant "
+                f"{record.get('applicant_id', '')}: {record.get('amount', '')} "
+                f"{record.get('currency', '')} per {record.get('period', '')}; "
+                f"reason: {record.get('reason', '')}"
+            )
+        lines.append("")
 
     credit_report = evidence.get("core", {}).get("credit_report")
     if credit_report:
@@ -253,6 +277,16 @@ def _render_public_records(states: EvidenceResult) -> str:
         if record.get("permitted_facts"):
             for key, value in record["permitted_facts"].items():
                 lines.append(f"- Permitted fact {key}: {value}")
+        lines.append("")
+    if states.public_search_outcomes:
+        lines.extend(["## Search Outcomes", ""])
+        platform_labels = {"facebook": "Facebook", "linkedin": "LinkedIn"}
+        for outcome in states.public_search_outcomes:
+            source_type = outcome.get("source_type", "")
+            label = platform_labels.get(source_type, str(source_type))
+            searched_at = outcome.get("searched_at", "")
+            date_suffix = f" ({searched_at})" if searched_at else ""
+            lines.append(f"- {label}: {outcome.get('status', '')}{date_suffix}")
         lines.append("")
     public_issues = [issue for issue in states.issues if _public_issue(issue.code)]
     if public_issues:

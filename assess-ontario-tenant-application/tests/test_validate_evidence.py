@@ -196,6 +196,82 @@ class EvidencePolicyTests(unittest.TestCase):
             [issue.code for issue in result.issues],
         )
 
+    def test_identity_matches_must_be_a_list(self) -> None:
+        data = evidence()
+        data["public_records"] = [
+            {
+                "source_type": "news",
+                "url": "https://example.invalid/string-matches",
+                "identity_matches": "full_name",
+            }
+        ]
+
+        result = validate_and_classify(data, manifest())
+
+        self.assertEqual((), result.accepted_public_records)
+
+    def test_social_excerpt_is_not_an_allowed_identity_fact(self) -> None:
+        data = evidence()
+        data["public_records"] = [
+            {
+                "source_type": "linkedin",
+                "url": "https://linkedin.example.invalid/profile",
+                "identity_matches": ["full_name", "verified_employer"],
+                "permitted_facts": {"declared_employer_matches": True},
+                "excerpt": "Synthetic post content",
+            }
+        ]
+
+        result = validate_and_classify(data, manifest("granted"))
+
+        self.assertEqual((), result.accepted_public_records)
+        self.assertIn("SOCIAL_FIELD_NOT_ALLOWED", [item.code for item in result.issues])
+
+    def test_every_unresolved_discrepancy_goes_to_human_review(self) -> None:
+        data = evidence()
+        data["discrepancies"] = [
+            {
+                "classification": "minor_difference",
+                "human_disposition": "",
+            }
+        ]
+
+        result = validate_and_classify(data, manifest())
+
+        self.assertEqual("clarification_pending", result.integrity_state)
+
+    def test_unconfirmed_recurring_income_goes_to_human_review(self) -> None:
+        data = evidence()
+        data["financial_input"] = {
+            "incomes": [
+                {
+                    "confirmed": False,
+                    "recurring": True,
+                    "amount": "5000",
+                }
+            ],
+            "debts": [],
+        }
+
+        result = validate_and_classify(data, manifest())
+
+        self.assertEqual("clarification_pending", result.integrity_state)
+        self.assertIn("CRITICAL_VALUE_UNCONFIRMED", [item.code for item in result.issues])
+
+    def test_future_dated_credit_report_is_not_current(self) -> None:
+        data = evidence()
+        data["core"]["credit_report"] = {
+            "acquisition": "manager_authorized",
+            "generated_at": "2026-08-05",
+            "score": 720,
+        }
+
+        result = validate_and_classify(
+            data, manifest(), today=date(2026, 8, 4)
+        )
+
+        self.assertIn("CREDIT_REPORT_FUTURE_DATE", [item.code for item in result.issues])
+
 
 if __name__ == "__main__":
     unittest.main()

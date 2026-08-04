@@ -92,6 +92,7 @@ def validate_case(case_dir: Path, today: date | None = None) -> ValidationResult
                 "Every listed applicant must be a lease signer.",
             )
         )
+    case_root = case_dir.resolve()
     for applicant in applicants:
         for file_record in applicant.get("files", []):
             relative = Path(file_record.get("path", ""))
@@ -101,7 +102,18 @@ def validate_case(case_dir: Path, today: date | None = None) -> ValidationResult
                         "UNSUPPORTED_FILE_TYPE", "blocking", str(relative)
                     )
                 )
-            elif not (case_dir / relative).is_file():
+                continue
+            candidate = (case_root / relative).resolve()
+            try:
+                candidate.relative_to(case_root)
+            except ValueError:
+                issues.append(
+                    ValidationIssue(
+                        "CASE_FILE_PATH_INVALID", "blocking", str(relative)
+                    )
+                )
+                continue
+            if not candidate.is_file():
                 issues.append(
                     ValidationIssue("MISSING_CASE_FILE", "blocking", str(relative))
                 )

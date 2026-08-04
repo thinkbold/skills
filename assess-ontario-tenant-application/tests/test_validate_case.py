@@ -108,6 +108,24 @@ class CaseValidationTests(unittest.TestCase):
                 self.assertFalse(result.can_extract)
                 self.assertIn(expected_code, {issue.code for issue in result.issues})
 
+    def test_case_file_cannot_escape_case_directory(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            case_dir = root / "case"
+            case_dir.mkdir()
+            outside = root / "outside.pdf"
+            outside.write_bytes(b"%PDF-1.4 synthetic outside file")
+            manifest = valid_manifest()
+            manifest["applicants"][0]["files"][0]["path"] = "../outside.pdf"
+            (case_dir / "case-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+            result = validate_case(case_dir, today=date(2026, 8, 4))
+
+        self.assertFalse(result.can_extract)
+        self.assertIn("CASE_FILE_PATH_INVALID", {issue.code for issue in result.issues})
+
 
 if __name__ == "__main__":
     unittest.main()
