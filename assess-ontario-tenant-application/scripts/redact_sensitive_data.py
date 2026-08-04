@@ -31,6 +31,10 @@ PROTECTED_KEYS = {
 }
 
 
+def normalize_field_name(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
 @dataclass(frozen=True)
 class RedactionFinding:
     kind: str
@@ -66,10 +70,11 @@ def sanitize_value(value: Any, path: str = "$") -> SanitizationResult:
             clean: dict[str, Any] = {}
             for key, item in node.items():
                 child = f"{current}.{key}"
-                if key in PROTECTED_KEYS:
+                normalized_key = normalize_field_name(key)
+                if normalized_key in PROTECTED_KEYS:
                     findings.append(RedactionFinding("protected_field", key, child))
                     continue
-                if key == "birth_date":
+                if normalized_key == "birth_date":
                     findings.append(RedactionFinding("identity_field", key, child))
                     clean["identity_birth_date_match"] = "not_confirmed"
                     continue

@@ -184,6 +184,34 @@ class BuildReportTests(unittest.TestCase):
         self.assertEqual("", decision["selected_reason_code"])
         self.assertEqual(ALLOWED_REASON_CODES, decision["allowed_reason_codes"])
 
+    def test_non_recurring_income_is_displayed_separately(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            case_dir = Path(temporary_directory)
+            facts = financials()
+            facts["excluded_income_records"] = [
+                {
+                    "applicant_id": "a",
+                    "amount": "12000",
+                    "currency": "CAD",
+                    "period": "annual",
+                    "basis": "gross_employment",
+                    "reason": "non_recurring",
+                }
+            ]
+            build_package(
+                case_dir,
+                manifest(),
+                evidence(),
+                facts,
+                states(),
+                preflight(),
+                {"version": "2026.08.03"},
+            )
+            assessment = (case_dir / "outputs/assessment.md").read_text()
+
+        self.assertIn("Excluded Income Records", assessment)
+        self.assertIn("12000 CAD", assessment)
+
 
 if __name__ == "__main__":
     unittest.main()

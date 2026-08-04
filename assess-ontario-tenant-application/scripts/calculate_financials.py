@@ -85,7 +85,14 @@ def calculate_financials(evidence: dict[str, Any]) -> dict[str, Any]:
         if not record.get("confirmed") or not record.get("recurring"):
             reason = "unconfirmed" if not record.get("confirmed") else "non_recurring"
             excluded_income_records.append(
-                {"applicant_id": applicant_id, "reason": reason}
+                {
+                    "applicant_id": applicant_id,
+                    "amount": str(record.get("amount", "")),
+                    "currency": str(record.get("currency", "")),
+                    "period": str(record.get("period", "")),
+                    "basis": str(record.get("basis", "")),
+                    "reason": reason,
+                }
             )
             continue
         if normalized < 0:

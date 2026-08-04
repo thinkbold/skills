@@ -193,6 +193,17 @@ class FinancialCalculationTests(unittest.TestCase):
             "0.00", result["household"]["gross_monthly_income_cad"]
         )
         self.assertEqual(1, len(result["excluded_income_records"]))
+        self.assertEqual(
+            {
+                "applicant_id": "a",
+                "amount": "12000",
+                "currency": "CAD",
+                "period": "monthly",
+                "basis": "gross_employment",
+                "reason": "non_recurring",
+            },
+            result["excluded_income_records"][0],
+        )
 
     def test_negative_monthly_debt_is_rejected(self) -> None:
         with self.assertRaisesRegex(AssessmentError, "cannot be negative"):

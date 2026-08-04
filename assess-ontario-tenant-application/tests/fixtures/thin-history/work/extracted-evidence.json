@@ -1,0 +1,28 @@
+{
+  "core": {
+    "evidence_available": true,
+    "credit_history_available": false,
+    "rental_history_available": false
+  },
+  "core_facts": [],
+  "discrepancies": [],
+  "payment_facts": [],
+  "public_records": [],
+  "public_search_outcomes": [],
+  "accommodation_review_required": false,
+  "financial_input": {
+    "monthly_rent_cad": "2000.00",
+    "exchange_rates": {},
+    "incomes": [{
+      "applicant_id": "applicant-gamma",
+      "amount": "15000",
+      "period": "period_total",
+      "months_covered": 5,
+      "currency": "CAD",
+      "confirmed": true,
+      "recurring": true,
+      "basis": "gross_employment"
+    }],
+    "debts": []
+  }
+}

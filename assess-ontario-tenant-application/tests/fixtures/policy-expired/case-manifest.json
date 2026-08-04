@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "case_id": "synthetic-policy-expired",
+  "jurisdiction": {"country": "CA", "province": "ON"},
+  "housing": {
+    "market_type": "market",
+    "owner_shared_kitchen_or_bathroom": false,
+    "address": "500 Example Crescent, Windsor, ON",
+    "monthly_rent_cad": "1700.00",
+    "expected_start_date": "2026-12-01",
+    "term_months": 12
+  },
+  "applicants": [{
+    "applicant_id": "applicant-zeta",
+    "lease_signer": true,
+    "files": [{"path": "inputs/application.pdf", "kind": "application"}]
+  }],
+  "privacy": {
+    "responsible_person": "Synthetic Manager",
+    "controlled_storage_confirmed": true,
+    "access_correction_process_confirmed": true
+  },
+  "authorizations": {
+    "general": {
+      "version": "synthetic-counsel-reviewed-1",
+      "signed_at": "2026-08-01",
+      "open_web_disclosed": true
+    },
+    "social": {"status": "not_requested"}
+  },
+  "decision": {"status": "pending", "legal_hold": false}
+}

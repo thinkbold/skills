@@ -32,6 +32,17 @@ class RedactionTests(unittest.TestCase):
             {"identity_birth_date_match": "not_confirmed"}, result.value
         )
 
+    def test_protected_key_matching_is_case_and_separator_insensitive(self) -> None:
+        result = sanitize_value(
+            {
+                "Applicant_ID": "a",
+                "Religion": "synthetic",
+                "Marital Status": "synthetic",
+            }
+        )
+
+        self.assertEqual({"Applicant_ID": "a"}, result.value)
+
 
 if __name__ == "__main__":
     unittest.main()

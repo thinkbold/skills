@@ -1,0 +1,39 @@
+{
+  "core": {"evidence_available": true, "credit_history_available": true, "rental_history_available": true},
+  "core_facts": [],
+  "discrepancies": [],
+  "payment_facts": [],
+  "public_records": [
+    {
+      "source_type": "linkedin",
+      "url": "https://linkedin.example.invalid/synthetic-delta",
+      "identity_matches": ["full_name", "verified_employer"],
+      "permitted_facts": {"declared_employer_matches": true}
+    },
+    {
+      "source_type": "facebook",
+      "url": "https://facebook.example.invalid/synthetic-delta",
+      "identity_matches": ["full_name", "verified_city"],
+      "permitted_facts": {"identity_exists": true}
+    }
+  ],
+  "public_search_outcomes": [
+    {"source_type": "facebook", "status": "withdrawn", "searched_at": "2026-08-03"},
+    {"source_type": "linkedin", "status": "withdrawn", "searched_at": "2026-08-03"}
+  ],
+  "accommodation_review_required": false,
+  "financial_input": {
+    "monthly_rent_cad": "1800.00",
+    "exchange_rates": {},
+    "incomes": [{
+      "applicant_id": "applicant-delta",
+      "amount": "5000",
+      "period": "monthly",
+      "currency": "CAD",
+      "confirmed": true,
+      "recurring": true,
+      "basis": "gross_employment"
+    }],
+    "debts": []
+  }
+}

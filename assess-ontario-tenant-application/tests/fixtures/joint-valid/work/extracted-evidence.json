@@ -1,0 +1,96 @@
+{
+  "core": {
+    "evidence_available": true,
+    "credit_history_available": true,
+    "rental_history_available": true,
+    "credit_report": {
+      "acquisition": "manager_authorized",
+      "generated_at": "2026-08-01",
+      "score": 710,
+      "reported_factors": ["Synthetic factor reported by bureau"]
+    }
+  },
+  "core_facts": [
+    {
+      "applicant_id": "applicant-alpha",
+      "fact_type": "employment_status",
+      "original_value": "Current",
+      "normalized_value": "current",
+      "source_file": "inputs/applicant-alpha.pdf",
+      "location": "page 1",
+      "confidence": "high",
+      "confirmed": true
+    },
+    {
+      "applicant_id": "applicant-beta",
+      "fact_type": "employer",
+      "original_value": "Synthetic Employer Inc.",
+      "normalized_value": "Synthetic Employer Inc.",
+      "source_file": "inputs/applicant-beta.pdf",
+      "location": "page 1",
+      "confidence": "high",
+      "confirmed": true
+    }
+  ],
+  "discrepancies": [],
+  "payment_facts": [],
+  "public_records": [
+    {
+      "source_type": "ltb",
+      "url": "https://ltb.example.invalid/case/synthetic-001",
+      "identity_matches": ["full_name", "verified_city"],
+      "party_role": "tenant",
+      "case_type": "synthetic maintenance application",
+      "status": "final",
+      "result": "synthetic disposition",
+      "finding_against_applicant": false,
+      "source_name": "Synthetic LTB index",
+      "retrieved_at": "2026-08-04"
+    }
+  ],
+  "public_search_outcomes": [
+    {"source_type": "facebook", "status": "no_match", "searched_at": "2026-08-04"},
+    {"source_type": "linkedin", "status": "no_match", "searched_at": "2026-08-04"}
+  ],
+  "accommodation_review_required": false,
+  "financial_input": {
+    "monthly_rent_cad": "2400.00",
+    "exchange_rates": {},
+    "incomes": [
+      {
+        "applicant_id": "applicant-alpha",
+        "amount": "72000",
+        "period": "annual",
+        "currency": "CAD",
+        "confirmed": true,
+        "recurring": true,
+        "basis": "gross_employment"
+      },
+      {
+        "applicant_id": "applicant-beta",
+        "amount": "1800",
+        "period": "biweekly",
+        "currency": "CAD",
+        "confirmed": true,
+        "recurring": true,
+        "basis": "gross_employment"
+      }
+    ],
+    "debts": [
+      {
+        "applicant_id": "applicant-alpha",
+        "balance": "10000",
+        "monthly_payment": "325",
+        "currency": "CAD",
+        "confirmed": true
+      },
+      {
+        "applicant_id": "applicant-beta",
+        "balance": "5000",
+        "monthly_payment": null,
+        "currency": "CAD",
+        "confirmed": true
+      }
+    ]
+  }
+}
