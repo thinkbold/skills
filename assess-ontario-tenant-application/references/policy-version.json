@@ -2,5 +2,15 @@
   "version": "2026.08.03",
   "last_reviewed": "2026-08-03",
   "review_interval_days": 90,
-  "reviewer_role": "qualified-ontario-reviewer"
+  "reviewer_role": "qualified-ontario-reviewer",
+  "sources": [
+    "https://www.ontario.ca/laws/regulation/980290",
+    "https://www.ontario.ca/page/credit-reports",
+    "https://www.ohrc.on.ca/en/policy-human-rights-and-rental-housing/v-identifying-discrimination-rental-housing",
+    "https://www.priv.gc.ca/en/privacy-topics/landlords-and-tenants/02_05_d_66_tips/",
+    "https://www.priv.gc.ca/en/privacy-topics/privacy-laws-in-canada/the-personal-information-protection-and-electronic-documents-act-pipeda/p_principle/",
+    "https://www.ontario.ca/page/police-record-checks",
+    "https://tribunalsontario.ca/ltb/law-rules-and-decisions/",
+    "https://tribunalsontario.ca/hrto/application-and-hearing-process/"
+  ]
 }
