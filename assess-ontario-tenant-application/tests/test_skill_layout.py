@@ -17,15 +17,59 @@ class SkillLayoutTests(unittest.TestCase):
         missing = [path for path in expected if not (SKILL_ROOT / path).exists()]
         self.assertEqual([], missing)
 
-    def test_skill_frontmatter_has_only_required_keys(self) -> None:
+    def test_skill_frontmatter_is_portable(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         frontmatter = text.split("---", 2)[1]
         keys = {
             line.split(":", 1)[0].strip()
             for line in frontmatter.splitlines()
-            if ":" in line
+            if ":" in line and not line.startswith((" ", "\t"))
         }
-        self.assertEqual({"name", "description"}, keys)
+        self.assertEqual({"name", "description", "metadata"}, keys)
+        self.assertIn("  compatibility:", frontmatter)
+        self.assertIn("Python 3.10+", frontmatter)
+        self.assertIn("web/browser", frontmatter)
+
+    def test_skill_stops_when_runtime_capability_is_missing(self) -> None:
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("missing runtime capability", text.lower())
+        self.assertIn("Do not silently skip", text)
+
+    def test_bilingual_user_guide_covers_supported_runtimes(self) -> None:
+        path = SKILL_ROOT / "USER_GUIDE.md"
+        self.assertTrue(path.is_file(), "bilingual user guide is missing")
+        text = path.read_text(encoding="utf-8")
+        required = [
+            "English",
+            "中文",
+            "Codex",
+            "Claude Code",
+            "GitHub Copilot CLI",
+            "Agent Skills-compatible",
+            "~/.agents/skills",
+            "~/.claude/skills",
+            ".agents/skills",
+            ".claude/skills",
+        ]
+        self.assertEqual([], [item for item in required if item not in text])
+
+    def test_user_guide_covers_operation_and_safety(self) -> None:
+        path = SKILL_ROOT / "USER_GUIDE.md"
+        self.assertTrue(path.is_file(), "bilingual user guide is missing")
+        text = path.read_text(encoding="utf-8")
+        required = [
+            "Prerequisites / 前置条件",
+            "Install / 安装",
+            "Use / 使用",
+            "Update / 更新",
+            "Uninstall / 卸载",
+            "outputs/",
+            "human",
+            "人工",
+            "Do not silently skip",
+            "不得静默跳过",
+        ]
+        self.assertEqual([], [item for item in required if item not in text])
 
     def test_skill_body_names_hard_stops_and_pipeline(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
