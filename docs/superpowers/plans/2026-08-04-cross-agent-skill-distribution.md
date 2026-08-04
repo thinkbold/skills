@@ -26,7 +26,7 @@
 
 **Interfaces:**
 - Consumes: Agent Skills YAML frontmatter parsed from the text between the first two `---` delimiters.
-- Produces: `name`, `description`, and `compatibility` keys; a runtime-capability stop rule in the skill body.
+- Produces: `name`, `description`, and `metadata` keys with a nested `compatibility` value; a runtime-capability stop rule in the skill body.
 
 - [ ] **Step 1: Write the failing frontmatter and runtime-capability tests**
 
@@ -37,9 +37,10 @@ def test_skill_frontmatter_is_portable(self) -> None:
     keys = {
         line.split(":", 1)[0].strip()
         for line in frontmatter.splitlines()
-        if ":" in line
+        if ":" in line and not line.startswith((" ", "\t"))
     }
-    self.assertEqual({"name", "description", "compatibility"}, keys)
+    self.assertEqual({"name", "description", "metadata"}, keys)
+    self.assertIn("  compatibility:", frontmatter)
     self.assertIn("Python 3.10+", frontmatter)
     self.assertIn("web/browser", frontmatter)
 
@@ -58,14 +59,15 @@ PYTHONPATH=assess-ontario-tenant-application python3 -m unittest \
   assess-ontario-tenant-application/tests/test_skill_layout.py -v
 ```
 
-Expected: FAIL because `compatibility` and the runtime stop wording are absent.
+Expected: FAIL because `metadata.compatibility` and the runtime stop wording are absent.
 
 - [ ] **Step 3: Add portable compatibility metadata and stop behavior**
 
 Add this frontmatter field:
 
 ```yaml
-compatibility: Requires Python 3.10+, local filesystem and shell access, and authorized web/browser search for public-source stages; final review remains human.
+metadata:
+  compatibility: "Requires Python 3.10+, local filesystem and shell access, and authorized web/browser search for public-source stages; final review remains human."
 ```
 
 Add a short runtime compatibility section that treats `agents/openai.yaml` as optional UI metadata and requires the agent to stop an affected stage, identify the missing capability, and leave the package incomplete.

@@ -1,6 +1,8 @@
 ---
 name: assess-ontario-tenant-application
 description: Assess one Ontario market-rate residential tenant application case folder by extracting and validating application, income, credit, debt, rental-history, and authorized public-source evidence; use when a property manager or landlord needs an auditable human-review package without applicant ranking, predictive scoring, or automated approval or rejection.
+metadata:
+  compatibility: "Requires Python 3.10+, local filesystem and shell access, and authorized web/browser search for public-source stages; final review remains human."
 ---
 
 # Assess Ontario Tenant Application
@@ -10,6 +12,18 @@ description: Assess one Ontario market-rate residential tenant application case 
 Assess the application evidence for one Ontario market-rental case. Produce an English evidence package for a property manager or individual landlord. Assess evidence, not a person's character or worth.
 
 Never rank applicants, assign a person score, predict default, or make the tenancy decision. Never infer a missing fact. Never send outreach.
+
+## Runtime Compatibility
+
+This skill follows the portable Agent Skills `SKILL.md` convention. Treat
+`agents/openai.yaml` as optional Codex interface metadata, not as a workflow
+dependency.
+
+Before starting, confirm the runtime can read and write the controlled case
+directory, run the bundled Python scripts, and perform authorized web/browser
+searches. If there is a missing runtime capability, stop the affected stage,
+name the missing capability, and leave the package incomplete. Do not silently skip
+a required stage or replace a deterministic script with prose arithmetic.
 
 ## Start Here
 

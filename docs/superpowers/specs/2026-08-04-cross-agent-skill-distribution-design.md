@@ -19,8 +19,9 @@ project skill location.
 
 `SKILL.md` remains the only normative workflow. `agents/openai.yaml` remains
 optional Codex interface metadata and must not be required by the scripts or
-other agents. Add the standard `compatibility` frontmatter field to declare the
-runtime capabilities needed for full execution.
+other agents. Declare the runtime capabilities needed for full execution under
+`metadata.compatibility`, which is accepted by the current Codex validator and
+by Agent Skills implementations that accept the standard metadata mapping.
 
 ## Files
 
@@ -57,8 +58,8 @@ the case directory and required tools.
 
 The bundle follows the Agent Skills directory convention: a directory named
 `assess-ontario-tenant-application` containing `SKILL.md` with portable `name`,
-`description`, and `compatibility` frontmatter plus relative references to
-bundled resources.
+`description`, and `metadata` frontmatter plus relative references to bundled
+resources. The metadata mapping contains a `compatibility` value.
 
 Full execution requires:
 
@@ -82,8 +83,8 @@ Add tests before implementation that require:
 - `USER_GUIDE.md` exists and contains paired English and Chinese sections;
 - the guide covers Codex, Claude Code, Copilot CLI, generic runtimes, personal
   and project paths, invocation, outputs, updating, and uninstalling;
-- `SKILL.md` declares the standard compatibility field and does not require
-  `agents/openai.yaml`;
+- `SKILL.md` declares runtime requirements under `metadata.compatibility` and
+  does not require `agents/openai.yaml`;
 - portable relative resource paths remain valid;
 - the existing no-score, no-ranking, no-prediction, no-automatic-decision, and
   public-source isolation invariants remain present.
