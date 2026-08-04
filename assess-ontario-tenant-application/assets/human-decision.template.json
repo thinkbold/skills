@@ -1,0 +1,13 @@
+{
+  "decided_by": "",
+  "decided_at": "",
+  "selected_reason_code": "",
+  "other_explanation": "",
+  "allowed_reason_codes": [
+    "chronological_first_meeting_uniform_criteria",
+    "applicant_withdrew",
+    "required_evidence_not_supplied_by_deadline",
+    "confirmed_material_conflict",
+    "other_requires_explanation"
+  ]
+}
