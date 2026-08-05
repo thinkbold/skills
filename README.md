@@ -1,0 +1,99 @@
+# ThinkBold Agent Skills
+
+Portable Agent Skills maintained by ThinkBold.
+
+可在多个 Agent 运行时使用的 ThinkBold Agent Skills。
+
+## Assess Ontario Tenant Application
+
+`assess-ontario-tenant-application` prepares an auditable evidence package for
+one ordinary Ontario market-rental application. It does not rank applicants,
+predict default, or make an approval or rejection decision. Final review and
+the tenancy decision remain human.
+
+`assess-ontario-tenant-application` 为一宗安大略省普通市场住宅租赁申请生成
+可审计的证据包。它不对申请人排序、不预测违约，也不自动批准或拒绝申请；最终
+复核和租赁决定必须由人工完成。
+
+### Install / 安装
+
+Install globally and choose one or more detected agents interactively:
+
+全局安装，并在交互界面中选择一个或多个已检测到的 Agent：
+
+```bash
+npx skills add thinkbold/skills \
+  --skill assess-ontario-tenant-application \
+  --global
+```
+
+For a non-interactive installation into Codex, Claude Code, and GitHub
+Copilot:
+
+如需无人值守地安装到 Codex、Claude Code 和 GitHub Copilot：
+
+```bash
+DISABLE_TELEMETRY=1 npx skills add thinkbold/skills \
+  --skill assess-ontario-tenant-application \
+  --global \
+  --agent codex \
+  --agent claude-code \
+  --agent github-copilot \
+  --yes
+```
+
+The installer requires Node.js and npm. The installed skill itself requires
+Python 3.10 or newer and uses only the Python standard library. See the
+[bilingual user guide](assess-ontario-tenant-application/USER_GUIDE.md) for
+privacy prerequisites, manual installation, case preparation, invocation, and
+uninstall instructions.
+
+安装器需要 Node.js 和 npm。Skill 安装后只需要 Python 3.10 或更高版本，其脚本
+仅使用 Python 标准库。隐私前置条件、手工安装、案件准备、调用和卸载方法见
+[双语用户指南](assess-ontario-tenant-application/USER_GUIDE.md)。
+
+### Use / 使用
+
+```text
+Use assess-ontario-tenant-application to assess exactly one Ontario market-rental case at /secure/path/to/case-001. Run preflight before opening evidence and leave the tenancy decision for human review.
+```
+
+```text
+使用 assess-ontario-tenant-application 评估 /secure/path/to/case-001 中唯一一宗安大略省普通市场租赁申请。读取证据前先运行 preflight，并将最终租赁决定留给人工完成。
+```
+
+Never place live applicant data in this repository or an unapproved cloud
+workspace.
+
+不得把真实申请人资料放入本仓库或未经批准的云端工作区。
+
+### Update or remove / 更新或卸载
+
+```bash
+npx skills update assess-ontario-tenant-application
+npx skills remove assess-ontario-tenant-application
+```
+
+### Versioned releases / 版本化发布
+
+Production deployments should review and pin a tagged release instead of
+following `main` without review. Tags use the format
+`assess-ontario-tenant-application-vX.Y.Z`. Each
+[GitHub release](https://github.com/thinkbold/skills/releases) includes a skill
+archive and a SHA-256 checksum.
+
+生产部署应审阅并固定到一个 tag，不应在未经复核的情况下持续跟随 `main`。Tag
+格式为 `assess-ontario-tenant-application-vX.Y.Z`；每个
+[GitHub Release](https://github.com/thinkbold/skills/releases) 都包含 skill 压缩包
+及 SHA-256 校验文件。
+
+## Development / 开发
+
+```bash
+PYTHONPATH=assess-ontario-tenant-application python3 -m unittest discover \
+  -s assess-ontario-tenant-application/tests -v
+```
+
+## License
+
+[MIT](LICENSE)

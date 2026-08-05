@@ -3,6 +3,7 @@ import unittest
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = SKILL_ROOT.parent
 
 
 class SkillLayoutTests(unittest.TestCase):
@@ -68,6 +69,41 @@ class SkillLayoutTests(unittest.TestCase):
             "人工",
             "Do not silently skip",
             "不得静默跳过",
+        ]
+        self.assertEqual([], [item for item in required if item not in text])
+
+    def test_distribution_has_one_command_install_and_manual_fallback(self) -> None:
+        readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        guide = (SKILL_ROOT / "USER_GUIDE.md").read_text(encoding="utf-8")
+        required_readme = [
+            "npx skills add thinkbold/skills",
+            "--skill assess-ontario-tenant-application",
+            "--agent codex",
+            "--agent claude-code",
+            "--agent github-copilot",
+        ]
+        required_guide = [
+            "Recommended: one command / 推荐：一条命令",
+            "Manual fallback / 手工安装 fallback",
+            "npx skills update assess-ontario-tenant-application",
+            "npx skills remove assess-ontario-tenant-application",
+        ]
+        self.assertEqual(
+            [], [item for item in required_readme if item not in readme]
+        )
+        self.assertEqual([], [item for item in required_guide if item not in guide])
+
+    def test_release_workflow_validates_and_packages_the_skill(self) -> None:
+        path = REPOSITORY_ROOT / ".github/workflows/validate-and-release.yml"
+        self.assertTrue(path.is_file(), "validation and release workflow is missing")
+        text = path.read_text(encoding="utf-8")
+        required = [
+            "assess-ontario-tenant-application-v*",
+            "python -m unittest discover",
+            "npx --yes skills add . --list",
+            "tar -czf",
+            "sha256sum",
+            "gh release create",
         ]
         self.assertEqual([], [item for item in required if item not in text])
 

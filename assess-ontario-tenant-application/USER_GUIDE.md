@@ -29,6 +29,9 @@ Full execution requires all of the following:
 
 - Python 3.10 or newer. The bundled scripts use only the Python standard
   library.
+- Node.js and npm only when using the recommended `npx skills` installer. They
+  are not runtime dependencies; use the manual fallback if they are
+  unavailable.
 - Local filesystem and shell access to one controlled case directory.
 - A browser or web-search tool for the authorized open-web stage.
 - An operator who can approve tool use, verify extracted facts, handle consent,
@@ -40,6 +43,8 @@ Full execution requires all of the following:
 完整执行需要同时满足以下条件：
 
 - Python 3.10 或更高版本；随附脚本只使用 Python 标准库。
+- 只有使用推荐的 `npx skills` 安装器时才需要 Node.js 和 npm；它们不是 skill
+  的运行时依赖。若环境中没有 Node.js 和 npm，请使用手工安装 fallback。
 - 能通过本地文件系统和 Shell 访问一个受控的案件目录。
 - 在已经取得授权的前提下，具备用于开放网络检索的浏览器或网页搜索工具。
 - 有操作人员负责批准工具调用、核对提取事实、处理授权，并完成人工决定。
@@ -53,12 +58,65 @@ calculation step.
 如果缺少任何能力，必须停止受影响的阶段并说明限制。不得静默跳过必需的检索、
 验证、脱敏或计算步骤。
 
-## Get the Skill / 获取 Skill
+## Install / 安装
 
-Clone or update the repository, then point `SKILL_SOURCE` at the canonical
-skill directory:
+### Recommended: one command / 推荐：一条命令
 
-克隆或更新仓库，然后让 `SKILL_SOURCE` 指向权威 skill 目录：
+Install globally, then choose one or more detected agents interactively:
+
+全局安装，然后在交互界面中选择一个或多个已检测到的 Agent：
+
+```bash
+npx skills add thinkbold/skills \
+  --skill assess-ontario-tenant-application \
+  --global
+```
+
+The installer supports Codex, Claude Code, GitHub Copilot CLI, and other Agent
+Skills-compatible runtimes. It selects the appropriate destination and can
+manage later updates and removal. Installing the skill does not approve any
+cloud agent or external service to receive applicant information.
+
+该安装器支持 Codex、Claude Code、GitHub Copilot CLI 及其他 Agent Skills
+兼容运行时，并会选择对应的目标目录，也可以管理后续更新和卸载。安装 skill
+并不表示允许任何云端 Agent 或外部服务接收申请人资料。
+
+For a non-interactive global installation into the three supported runtimes:
+
+如需无人值守地全局安装到三个受支持的运行时：
+
+```bash
+DISABLE_TELEMETRY=1 npx skills add thinkbold/skills \
+  --skill assess-ontario-tenant-application \
+  --global \
+  --agent codex \
+  --agent claude-code \
+  --agent github-copilot \
+  --yes
+```
+
+Omit `--global` to install for the current project. Run `npx skills list` after
+installation, note the installed skill path, and point `SKILL_SOURCE` at it for
+the case-preparation commands below. Restart an agent session if the skill does
+not appear.
+
+如需只安装到当前项目，请省略 `--global`。安装后运行 `npx skills list`，记下 skill
+的安装路径，并让 `SKILL_SOURCE` 指向该路径，以便执行下方的案件准备命令。如果
+skill 没有出现，请重启对应的 Agent 会话。
+
+```bash
+export SKILL_SOURCE="/path/reported/by/skills-list/assess-ontario-tenant-application"
+test -f "$SKILL_SOURCE/SKILL.md"
+```
+
+### Manual fallback / 手工安装 fallback
+
+Use this fallback when Node.js or npm is unavailable, when the installer cannot
+reach GitHub, or when organizational policy requires a reviewed local
+checkout. Clone the repository and verify the canonical skill directory:
+
+如果没有 Node.js 或 npm、安装器无法访问 GitHub，或组织政策要求使用经过审核的
+本地 checkout，请使用此 fallback。先克隆仓库并验证权威 skill 目录：
 
 ```bash
 git clone https://github.com/thinkbold/skills.git
@@ -67,125 +125,43 @@ export SKILL_SOURCE="$PWD/assess-ontario-tenant-application"
 test -f "$SKILL_SOURCE/SKILL.md"
 ```
 
-The following examples use a symbolic link so one checkout can serve multiple
-local agents. Use the copy command instead when links are unavailable. Run only
-the command for the runtime and scope you intend to use.
+Copy or link the complete directory into the runtime's documented personal or
+project skills parent. Common locations are:
 
-下列示例优先使用软链接，让同一个源码目录可供多个本地 agent 使用。如果环境
-不支持软链接，可以改用复制命令。只执行与你需要的运行时和作用域对应的命令。
+将完整目录复制或链接到运行时文档指定的个人级或项目级 skills 父目录。常见位置
+如下：
 
-## Install / 安装
+- Codex and cross-runtime: `~/.agents/skills` or `.agents/skills`
+- Claude Code: `~/.claude/skills` or `.claude/skills`
+- GitHub Copilot CLI: `~/.agents/skills`, `.agents/skills`, or `.github/skills`
 
-### Codex: personal or cross-runtime / Codex：个人或跨运行时
+Example:
 
-Install in the shared personal Agent Skills location:
-
-安装到个人级通用 Agent Skills 目录：
-
-```bash
-mkdir -p "$HOME/.agents/skills"
-ln -s "$SKILL_SOURCE" \
-  "$HOME/.agents/skills/assess-ontario-tenant-application"
-```
-
-For one repository, link it under that repository's `.agents/skills` folder:
-
-如果只供一个项目使用，在该项目的 `.agents/skills` 目录中建立链接：
+示例：
 
 ```bash
-export PROJECT_ROOT="/path/to/your/project"
-mkdir -p "$PROJECT_ROOT/.agents/skills"
-ln -s "$SKILL_SOURCE" \
-  "$PROJECT_ROOT/.agents/skills/assess-ontario-tenant-application"
-```
-
-`agents/openai.yaml` provides optional Codex display metadata. Other agents do
-not need it.
-
-`agents/openai.yaml` 只提供可选的 Codex 界面元数据，其他 agent 不依赖它。
-
-### Claude Code: personal or project / Claude Code：个人或项目
-
-Claude Code uses `~/.claude/skills` for personal skills and `.claude/skills`
-for project skills:
-
-Claude Code 的个人级目录是 `~/.claude/skills`，项目级目录是
-`.claude/skills`：
-
-```bash
-# Personal / 个人级
-mkdir -p "$HOME/.claude/skills"
-ln -s "$SKILL_SOURCE" \
-  "$HOME/.claude/skills/assess-ontario-tenant-application"
-
-# Project / 项目级
-export PROJECT_ROOT="/path/to/your/project"
-mkdir -p "$PROJECT_ROOT/.claude/skills"
-ln -s "$SKILL_SOURCE" \
-  "$PROJECT_ROOT/.claude/skills/assess-ontario-tenant-application"
-```
-
-If the top-level skills directory is created while Claude Code is already
-running and the skill does not appear, restart that Claude Code session.
-
-如果在 Claude Code 已运行时才新建顶层 skills 目录，而 skill 没有出现，请重启
-该 Claude Code 会话。
-
-### GitHub Copilot CLI: personal or project / GitHub Copilot CLI：个人或项目
-
-Use `~/.agents/skills` for a personal skill shared with other compatible
-runtimes, or `.agents/skills` for one project. Copilot also recognizes
-`.github/skills` for project-specific skills.
-
-个人级、可与其他兼容运行时共享时使用 `~/.agents/skills`；单个项目使用
-`.agents/skills`。Copilot 也支持项目内的 `.github/skills`。
-
-```bash
-# Personal / 个人级
-mkdir -p "$HOME/.agents/skills"
-ln -s "$SKILL_SOURCE" \
-  "$HOME/.agents/skills/assess-ontario-tenant-application"
-
-# Project using the GitHub-specific location / 使用 GitHub 项目级目录
-export PROJECT_ROOT="/path/to/your/project"
-mkdir -p "$PROJECT_ROOT/.github/skills"
-ln -s "$SKILL_SOURCE" \
-  "$PROJECT_ROOT/.github/skills/assess-ontario-tenant-application"
-```
-
-Use a local or otherwise privacy-approved Copilot environment for live
-applicant data. Installing the skill does not by itself approve a cloud agent
-to receive personal information.
-
-真实申请人资料只能在本地或已经通过隐私审批的 Copilot 环境中处理。安装该 skill
-本身并不代表可以把个人信息交给云端 agent。
-
-### Other runtimes / 其他运行时
-
-For another Agent Skills-compatible runtime, place the complete canonical
-directory under the personal or project skills parent documented by that
-runtime. Preserve the directory name and every bundled `scripts/`,
-`references/`, `assets/`, and `agents/` file. Format compatibility alone is not
-enough: the runtime must also satisfy the prerequisites above.
-
-对于其他 Agent Skills 兼容运行时，请按照该运行时的文档，把完整的权威目录放到
-个人级或项目级 skills 父目录下。必须保留目录名，以及其中全部 `scripts/`、
-`references/`、`assets/` 和 `agents/` 文件。仅格式兼容还不够，运行时也必须满足
-上述前置条件。
-
-### Copy instead of linking / 使用复制而不是软链接
-
-For any destination above, replace the link command with the following, after
-confirming the destination does not already exist:
-
-对于上述任一目标目录，确认目标尚不存在后，可以用下面的复制命令替代软链接：
-
-```bash
-export SKILLS_PARENT="/the/runtime/skills/parent"
+export SKILLS_PARENT="$HOME/.agents/skills"
 mkdir -p "$SKILLS_PARENT"
+ln -s "$SKILL_SOURCE" \
+  "$SKILLS_PARENT/assess-ontario-tenant-application"
+```
+
+If symbolic links are unavailable, confirm the destination does not already
+exist and replace `ln -s` with:
+
+如果环境不支持软链接，请先确认目标不存在，再用下列复制命令替代 `ln -s`：
+
+```bash
 cp -R "$SKILL_SOURCE" \
   "$SKILLS_PARENT/assess-ontario-tenant-application"
 ```
+
+Preserve the directory name and every bundled `scripts/`, `references/`,
+`assets/`, and `agents/` file. `agents/openai.yaml` is optional Codex display
+metadata and is not a workflow dependency.
+
+必须保留目录名以及全部 `scripts/`、`references/`、`assets/` 和 `agents/`
+文件。`agents/openai.yaml` 是可选的 Codex 界面元数据，不是工作流依赖。
 
 ## Prepare One Case / 准备一宗案件
 
@@ -320,33 +296,42 @@ evidence support for a human decision, not a decision or legal opinion.
 
 ## Update / 更新
 
-For a symlink installation, update the checkout and rerun the tests before live
-use:
+For an installation managed by the recommended installer:
 
-软链接安装只需更新源码 checkout，并在处理真实案件前重新运行测试：
+如果使用推荐安装器管理 skill：
 
 ```bash
-cd "$(dirname "$SKILL_SOURCE")"
-git pull --ff-only
-PYTHONPATH=assess-ontario-tenant-application python3 -m unittest discover \
-  -s assess-ontario-tenant-application/tests -v
+npx skills update assess-ontario-tenant-application
 ```
 
-For a copied installation, verify no live case data is stored inside the skill
-directory, remove the old copied skill directory through your normal approved
-file-management process, then repeat the copy command from the updated source.
+Review the release notes and rerun the bundled tests before using an updated
+version on a live case. For a manual symlink installation, update the canonical
+checkout with `git pull --ff-only`. For a manual copied installation, verify no
+case data is stored inside the skill directory, then replace the copy through
+your approved file-management process.
 
-如果使用复制安装，先确认 skill 目录内没有真实案件数据，再通过正常且获准的文件
-管理流程移除旧副本，然后从更新后的源码重新执行复制命令。
+在真实案件中使用更新版本前，应审阅 release notes 并重新运行随附测试。手工
+软链接安装可在权威 checkout 中运行 `git pull --ff-only`；手工复制安装则应先确认
+skill 目录内没有案件资料，再通过获准的文件管理流程替换副本。
 
 ## Uninstall / 卸载
 
-Remove only the installed skill link or copied skill directory from the chosen
-runtime's skills parent. Do not delete case directories as part of uninstall.
-Case deletion follows the retention plan and requires a reviewed dry run.
+For an installation managed by the recommended installer:
 
-只从所选运行时的 skills 父目录移除已安装的软链接或 skill 副本。卸载 skill 时
-不得删除案件目录。案件删除必须遵循留存计划，并先人工审阅 dry run。
+如果使用推荐安装器管理 skill：
+
+```bash
+npx skills remove assess-ontario-tenant-application
+```
+
+For a manual installation, remove only the installed skill link or copied
+skill directory from the chosen runtime's skills parent. Do not delete case
+directories as part of uninstall. Case deletion follows the retention plan and
+requires a reviewed dry run.
+
+手工安装时，只从所选运行时的 skills 父目录移除已安装的软链接或 skill 副本。
+卸载 skill 时不得删除案件目录。案件删除必须遵循留存计划，并先人工审阅 dry
+run。
 
 To preview case retention actions without deleting anything:
 
