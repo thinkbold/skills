@@ -126,6 +126,17 @@ class CaseValidationTests(unittest.TestCase):
         self.assertFalse(result.can_extract)
         self.assertIn("CASE_FILE_PATH_INVALID", {issue.code for issue in result.issues})
 
+    def test_missing_manifest_returns_actionable_blocker(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            result = validate_case(
+                Path(temporary_directory), today=date(2026, 8, 4)
+            )
+
+        self.assertFalse(result.can_extract)
+        self.assertFalse(result.can_finalize)
+        self.assertEqual(["MANIFEST_MISSING"], [issue.code for issue in result.issues])
+        self.assertIn("init_case.py", result.issues[0].message)
+
 
 if __name__ == "__main__":
     unittest.main()

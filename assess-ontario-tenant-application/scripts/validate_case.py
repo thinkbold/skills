@@ -19,7 +19,21 @@ POLICY_PATH = Path(__file__).resolve().parents[1] / "references/policy-version.j
 
 def validate_case(case_dir: Path, today: date | None = None) -> ValidationResult:
     today = today or date.today()
-    manifest = load_json(case_dir / "case-manifest.json")
+    manifest_path = case_dir / "case-manifest.json"
+    if not manifest_path.is_file():
+        return ValidationResult(
+            False,
+            False,
+            (
+                ValidationIssue(
+                    "MANIFEST_MISSING",
+                    "blocking",
+                    "case-manifest.json is missing. Complete the guided intake "
+                    "and run scripts/init_case.py before opening evidence.",
+                ),
+            ),
+        )
+    manifest = load_json(manifest_path)
     policy = load_json(POLICY_PATH)
     issues: list[ValidationIssue] = []
 

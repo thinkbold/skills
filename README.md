@@ -55,11 +55,11 @@ uninstall instructions.
 ### Use / 使用
 
 ```text
-Use assess-ontario-tenant-application to assess exactly one Ontario market-rental case at /secure/path/to/case-001. Run preflight before opening evidence and leave the tenancy decision for human review.
+Use assess-ontario-tenant-application to assess exactly one Ontario market-rental case at /secure/path/to/case-001. If case-manifest.json is missing, guide me through the required intake and create it before preflight. Do not open evidence until preflight passes, and leave the tenancy decision for human review.
 ```
 
 ```text
-使用 assess-ontario-tenant-application 评估 /secure/path/to/case-001 中唯一一宗安大略省普通市场租赁申请。读取证据前先运行 preflight，并将最终租赁决定留给人工完成。
+使用 assess-ontario-tenant-application 评估 /secure/path/to/case-001 中唯一一宗安大略省普通市场租赁申请。如果缺少 case-manifest.json，请先引导我回答所需问题并自动创建，再运行 preflight。preflight 通过前不要读取证据，并将最终租赁决定留给人工完成。
 ```
 
 Never place live applicant data in this repository or an unapproved cloud

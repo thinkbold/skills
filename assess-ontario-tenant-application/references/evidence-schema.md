@@ -10,7 +10,8 @@
 - `applicants`: only lease signers, each with a stable `applicant_id` and associated files.
 - `privacy`: responsible person, controlled-storage confirmation, access/correction-process confirmation.
 - `authorizations.general`: exact version, signature date, open-web disclosure.
-- `authorizations.social`: status and individually granted platforms.
+- `authorizations.social`: aggregate status, individually granted platforms,
+  and separate Facebook and LinkedIn status under `platform_statuses`.
 - `decision`: pending/completed/withdrawn status, applicable date, legal hold.
 
 Paths must be case-relative. Supported extensions are `.pdf`, `.png`, `.jpg`, `.jpeg`, `.csv`, `.txt`, and `.md`.

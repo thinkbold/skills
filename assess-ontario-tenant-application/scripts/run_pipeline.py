@@ -15,13 +15,13 @@ from scripts.validate_evidence import validate_and_classify
 
 def run_pipeline(case_dir: Path, today: date | None = None) -> list[Path]:
     assessment_date = today or date.today()
-    manifest = load_json(case_dir / "case-manifest.json")
     preflight = validate_case(case_dir, today=assessment_date)
     preflight_path = case_dir / "outputs/preflight.json"
     write_json(preflight_path, preflight.to_dict())
     if not preflight.can_extract:
         return [preflight_path]
 
+    manifest = load_json(case_dir / "case-manifest.json")
     extracted = load_json(case_dir / "work/extracted-evidence.json")
     sanitization = sanitize_value(extracted)
     sanitized_path = case_dir / "work/sanitized-evidence.json"

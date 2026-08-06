@@ -123,6 +123,18 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(assessment_exists)
         self.assertEqual(["preflight.json"], [path.name for path in paths])
 
+    def test_missing_manifest_writes_preflight_instead_of_crashing(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            case_dir = Path(temporary_directory)
+
+            paths = run_pipeline(case_dir, today=date(2026, 8, 4))
+            preflight = json.loads(
+                (case_dir / "outputs/preflight.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(["preflight.json"], [path.name for path in paths])
+        self.assertEqual("MANIFEST_MISSING", preflight["issues"][0]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

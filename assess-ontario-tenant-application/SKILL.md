@@ -29,9 +29,20 @@ a required stage or replace a deterministic script with prose arithmetic.
 
 1. Read [references/workflow.md](references/workflow.md) for the operator sequence.
 2. Read [references/ontario-compliance-policy.md](references/ontario-compliance-policy.md) before preflight.
-3. Run `scripts/validate_case.py CASE_DIR` before opening any application evidence.
-4. Stop if `outputs/preflight.json` has `can_extract: false`.
-5. Use only one case directory. Do not compare applicants with another case or create a cross-case profile.
+3. Before opening any application evidence, check for
+   `CASE_DIR/case-manifest.json`. If it is missing, read
+   [references/case-intake.md](references/case-intake.md), ask the user the
+   required questions, write the confirmed answers inside the controlled case
+   directory, and run `scripts/init_case.py CASE_DIR --answers ANSWERS_JSON`.
+   Never overwrite an existing manifest and never infer a yes/no answer.
+4. Run `scripts/validate_case.py CASE_DIR` before opening any application evidence.
+5. Stop if `outputs/preflight.json` has `can_extract: false`.
+6. Use only one case directory. Do not compare applicants with another case or create a cross-case profile.
+
+The guided intake must not ask for protected characteristics or use applicant
+names as identifiers. General authorization may be recorded as unavailable so
+the folder can be initialized, but preflight must then block evidence access.
+Facebook and LinkedIn consent must be asked and recorded separately.
 
 The case must concern ordinary market-rate residential housing in Ontario. Stop for another jurisdiction, rent-geared-to-income housing, commercial housing, or a home where the applicant shares a kitchen or bathroom with the owner or the owner's family.
 

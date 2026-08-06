@@ -173,13 +173,55 @@ compare separate applications.
 ```bash
 export CASE_DIR="/secure/path/to/case-001"
 mkdir -p "$CASE_DIR/inputs" "$CASE_DIR/work" "$CASE_DIR/outputs"
-cp "$SKILL_SOURCE/assets/case-manifest.template.json" \
-  "$CASE_DIR/case-manifest.json"
 ```
 
-Before invoking the skill:
+Place the case files under `inputs/`, then invoke the skill. If
+`case-manifest.json` is missing, the skill will ask only the required scope,
+privacy, rental, signing-applicant/file, authorization, platform-consent, and
+legal-hold questions. It will summarize the answers for correction, write a
+structured intake file inside the controlled case directory, run
+`scripts/init_case.py`, and then run preflight. It will never overwrite an
+existing manifest or open evidence before preflight passes.
 
-- Edit `case-manifest.json`; replace every synthetic example value.
+把案件文件放入 `inputs/`，然后调用 skill。如果缺少 `case-manifest.json`，skill
+会询问范围、隐私、租赁信息、签约申请人与文件映射、一般授权、各社交平台授权及
+legal hold 等必需问题；在请你核对答案后，把结构化 intake 文件写在受控案件目录
+内，运行 `scripts/init_case.py`，随后执行 preflight。它不会覆盖已有 manifest，
+也不会在 preflight 通过前读取证据内容。
+
+The guided intake uses stable non-name applicant IDs and does not ask for
+protected characteristics. If general authorization is unavailable, the
+manifest may still be created, but preflight will block evidence access.
+
+引导流程使用不含姓名的稳定申请人 ID，且不会询问受保护特征。一般授权尚未取得
+时仍可创建 manifest，但 preflight 会阻止读取证据。
+
+For manual or non-agent setup, copy and complete the intake template, then run
+the initializer:
+
+如需手工或非 Agent 初始化，可复制并填写 intake 模板，再运行初始化脚本：
+
+```bash
+cp "$SKILL_SOURCE/assets/case-intake.template.json" \
+  "$CASE_DIR/work/case-intake.json"
+# Complete every null or empty answer before continuing.
+PYTHONPATH="$SKILL_SOURCE" python3 \
+  "$SKILL_SOURCE/scripts/init_case.py" "$CASE_DIR" \
+  --answers "$CASE_DIR/work/case-intake.json"
+```
+
+The initializer validates the answers and referenced files and refuses to
+replace `case-manifest.json`. Operators who explicitly prefer to author the
+manifest directly may instead start from
+`assets/case-manifest.template.json`.
+
+初始化脚本会验证答案及引用文件，并拒绝替换已有的 `case-manifest.json`。明确希望
+直接编写 manifest 的操作人员仍可使用 `assets/case-manifest.template.json`。
+
+Before evidence access, confirm the following:
+
+- Review the generated or manually prepared `case-manifest.json`. If using the
+  manual manifest template, replace every synthetic example value.
 - Confirm Ontario (`CA`/`ON`), ordinary market housing, no owner-shared kitchen
   or bathroom, proposed rent, and lease term.
 - List only applicants who will sign this lease. Put each allowed PDF, PNG,
@@ -195,7 +237,8 @@ Before invoking the skill:
 
 调用 skill 前：
 
-- 编辑 `case-manifest.json`，替换所有合成示例值。
+- 复核自动生成或手工准备的 `case-manifest.json`；若使用手工 manifest 模板，
+  必须替换所有合成示例值。
 - 确认地点为安大略省（`CA`/`ON`）、属于普通市场住宅、不与业主或其家人共用
   厨房或卫生间，并填写拟议租金和租期。
 - 只列入本次租约的签约申请人。把允许的 PDF、PNG、JPEG、CSV、TXT 或 Markdown
@@ -237,25 +280,27 @@ Claude Code 和 Copilot CLI 也可能把它显示为
 
 The expected execution order is:
 
-1. Preflight and policy check before evidence access.
-2. Provenance-rich extraction to `work/extracted-evidence.json`.
-3. Redaction and protected-field isolation.
-4. Verification of income, monthly debt, credit, rental, and optional bank
+1. Guided manifest intake when `case-manifest.json` is missing.
+2. Preflight and policy check before evidence access.
+3. Provenance-rich extraction to `work/extracted-evidence.json`.
+4. Redaction and protected-field isolation.
+5. Verification of income, monthly debt, credit, rental, and optional bank
    evidence.
-5. Authorized open-web searches, with Facebook and LinkedIn gated separately.
-6. Deterministic calculation, evidence validation, and report generation.
-7. Human discrepancy handling, applicant correction opportunity, and final
+6. Authorized open-web searches, with Facebook and LinkedIn gated separately.
+7. Deterministic calculation, evidence validation, and report generation.
+8. Human discrepancy handling, applicant correction opportunity, and final
    human decision.
 
 预期执行顺序为：
 
-1. 在读取证据前完成 preflight 和政策检查。
-2. 将带完整来源定位的信息提取到 `work/extracted-evidence.json`。
-3. 脱敏并隔离受保护字段。
-4. 核验收入、每月债务、信用、租赁历史和可选银行资料。
-5. 执行已授权的开放网络检索，并分别检查 Facebook 和 LinkedIn 专项授权。
-6. 运行确定性计算、证据验证和报告生成。
-7. 由人工处理不匹配，给予申请人更正机会，并完成人工决定。
+1. 缺少 `case-manifest.json` 时执行引导式 manifest intake。
+2. 在读取证据前完成 preflight 和政策检查。
+3. 将带完整来源定位的信息提取到 `work/extracted-evidence.json`。
+4. 脱敏并隔离受保护字段。
+5. 核验收入、每月债务、信用、租赁历史和可选银行资料。
+6. 执行已授权的开放网络检索，并分别检查 Facebook 和 LinkedIn 专项授权。
+7. 运行确定性计算、证据验证和报告生成。
+8. 由人工处理不匹配，给予申请人更正机会，并完成人工决定。
 
 The agent may prepare employer, previous-landlord, and applicant clarification
 messages, but must not send them automatically.
@@ -351,6 +396,9 @@ PYTHONPATH="$SKILL_SOURCE" python3 \
   skill directory and run the bundled script by its absolute path.
 - **Preflight stops / Preflight 停止**: read only `outputs/preflight.json` and
   correct its listed prerequisites before evidence access.
+- **Manifest missing / 缺少 manifest**: let the skill run the guided intake, or
+  complete `assets/case-intake.template.json` and run `scripts/init_case.py`.
+  Do not copy synthetic manifest values into a live case.
 - **No browser or web tool / 没有浏览器或网页工具**: report a missing runtime
   capability and leave the required public-source stage incomplete. Do not
   silently skip it / 不得静默跳过。

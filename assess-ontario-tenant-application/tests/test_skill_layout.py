@@ -11,8 +11,11 @@ class SkillLayoutTests(unittest.TestCase):
         expected = [
             "SKILL.md",
             "agents/openai.yaml",
+            "scripts/init_case.py",
             "scripts/shared.py",
+            "references/case-intake.md",
             "references/policy-version.json",
+            "assets/case-intake.template.json",
             "assets/case-manifest.template.json",
         ]
         missing = [path for path in expected if not (SKILL_ROOT / path).exists()]
@@ -118,6 +121,16 @@ class SkillLayoutTests(unittest.TestCase):
             "Never rank",
             "public-records.md",
             "accommodation",
+        ]
+        self.assertEqual([], [item for item in required if item not in text])
+
+    def test_skill_guides_missing_manifest_intake(self) -> None:
+        text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required = [
+            "case-manifest.json",
+            "references/case-intake.md",
+            "scripts/init_case.py",
+            "Never overwrite",
         ]
         self.assertEqual([], [item for item in required if item not in text])
 

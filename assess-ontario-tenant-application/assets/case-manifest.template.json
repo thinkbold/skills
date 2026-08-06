@@ -37,7 +37,12 @@
       "open_web_disclosed": true
     },
     "social": {
-      "status": "not_requested"
+      "status": "not_requested",
+      "platforms": [],
+      "platform_statuses": {
+        "facebook": "not_requested",
+        "linkedin": "not_requested"
+      }
     }
   },
   "decision": {

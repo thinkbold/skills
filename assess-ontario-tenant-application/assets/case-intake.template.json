@@ -1,0 +1,40 @@
+{
+  "case_id": "",
+  "scope": {
+    "ordinary_ontario_market_rental": null,
+    "owner_shared_kitchen_or_bathroom": null
+  },
+  "housing": {
+    "address": "",
+    "monthly_rent_cad": "",
+    "expected_start_date": "",
+    "term_months": null
+  },
+  "applicants": [
+    {
+      "applicant_id": "applicant-a",
+      "files": [
+        {
+          "path": "inputs/application-a.pdf",
+          "kind": "application"
+        }
+      ]
+    }
+  ],
+  "privacy": {
+    "responsible_person": "",
+    "controlled_storage_confirmed": null,
+    "access_correction_process_confirmed": null
+  },
+  "general_authorization": {
+    "available": null,
+    "version": "",
+    "signed_at": "",
+    "open_web_disclosed": null
+  },
+  "social_consent": {
+    "facebook": "not_requested",
+    "linkedin": "not_requested"
+  },
+  "legal_hold": null
+}

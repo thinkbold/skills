@@ -1,4 +1,4 @@
 interface:
   display_name: "Assess Ontario Tenant Application"
   short_description: "Audit one Ontario rental application evidence package"
-  default_prompt: "Assess the Ontario tenant application case folder provided by the user and produce the English evidence package."
+  default_prompt: "Assess the Ontario tenant application case folder provided by the user. If case-manifest.json is missing, guide the user through intake and initialize it before preflight; then produce the English evidence package."

@@ -2,7 +2,13 @@
 
 ## 1. Prepare One Case
 
-- Copy `assets/case-manifest.template.json` into one controlled case directory as `case-manifest.json`.
+- Use one controlled case directory. If `case-manifest.json` is missing, follow
+  `case-intake.md`: ask the operator the required scope, privacy, housing,
+  signer/file, authorization, consent, and legal-hold questions; write the
+  answers to `work/case-intake.json`; then run `scripts/init_case.py`.
+- Never overwrite an existing manifest. The manual
+  `assets/case-manifest.template.json` remains available for operators who
+  explicitly prefer to prepare it themselves.
 - List only co-applicants who will sign this lease. Keep a guarantor separate.
 - Confirm the privacy-responsible person, controlled storage, correction process, general authorization version, and social consent status.
 - Accept PDF, PNG, JPEG, CSV, TXT, and Markdown only. Unlock password-protected documents inside the controlled environment.
