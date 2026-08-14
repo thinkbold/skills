@@ -1,7 +1,7 @@
 # Canadian Practice Platform — Wave 0 Foundation Design
 
 **Date:** 2026-08-13
-**Status:** Approved in sections; awaiting review of this written specification
+**Status:** Approved on 2026-08-13
 
 ## 1. Purpose
 
