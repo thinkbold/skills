@@ -1,0 +1,35 @@
+{
+  "name": "assess-ontario-tenant-application",
+  "version": "1.0.0",
+  "description": "Prepare an auditable evidence package for one Ontario residential tenant application.",
+  "author": {
+    "name": "ThinkBold",
+    "url": "https://github.com/thinkbold"
+  },
+  "homepage": "https://github.com/thinkbold/skills",
+  "repository": "https://github.com/thinkbold/skills",
+  "license": "MIT",
+  "keywords": [
+    "ontario",
+    "tenant-application",
+    "evidence",
+    "housing"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Assess Ontario Tenant Application",
+    "shortDescription": "Audit one Ontario rental application evidence package",
+    "longDescription": "Prepare a structured, auditable evidence package for one Ontario market-rental application while leaving the tenancy decision to a human reviewer.",
+    "developerName": "ThinkBold",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/thinkbold/skills",
+    "defaultPrompt": [
+      "Assess one Ontario tenant application case folder.",
+      "Validate an Ontario rental application before human review."
+    ]
+  }
+}
