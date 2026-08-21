@@ -1,0 +1,20 @@
+{
+  "name": "thinkbold-skills",
+  "interface": {
+    "displayName": "ThinkBold Skills"
+  },
+  "plugins": [
+    {
+      "name": "assess-ontario-tenant-application",
+      "source": {
+        "source": "local",
+        "path": "./plugins/assess-ontario-tenant-application"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
