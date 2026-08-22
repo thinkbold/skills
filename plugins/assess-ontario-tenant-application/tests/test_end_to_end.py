@@ -8,7 +8,10 @@ import unittest
 from scripts.run_pipeline import run_pipeline
 
 
-SKILL_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_NAME = "assess-ontario-tenant-application"
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+SKILL_ROOT = PLUGIN_ROOT / "skills" / PLUGIN_NAME
+TEST_ROOT = PLUGIN_ROOT / "tests"
 
 
 class EndToEndTests(unittest.TestCase):
@@ -16,7 +19,7 @@ class EndToEndTests(unittest.TestCase):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
         case_dir = Path(temporary_directory.name) / name
-        shutil.copytree(SKILL_ROOT / "tests/fixtures" / name, case_dir)
+        shutil.copytree(TEST_ROOT / "fixtures" / name, case_dir)
         run_pipeline(case_dir, today=today)
         return case_dir
 
@@ -25,7 +28,7 @@ class EndToEndTests(unittest.TestCase):
         for name in ("assessment.md", "public-records.md"):
             actual = (case / "outputs" / name).read_text(encoding="utf-8")
             expected = (
-                SKILL_ROOT / "tests/golden/joint-valid" / name
+                TEST_ROOT / "golden/joint-valid" / name
             ).read_text(encoding="utf-8")
             self.assertEqual(expected, actual)
 

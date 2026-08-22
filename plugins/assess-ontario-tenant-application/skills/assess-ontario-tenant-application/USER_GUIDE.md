@@ -1,13 +1,13 @@
 # Install and Use / 安装与使用
 
-This guide installs and runs `assess-ontario-tenant-application` as one
-portable Agent Skills bundle. The same bundle supports Codex, Claude Code,
-GitHub Copilot CLI, and other Agent Skills-compatible runtimes that provide the
-required local tools.
+This guide installs and runs `assess-ontario-tenant-application` as either an
+Agent Plugin for Codex or a portable Agent Skills-compatible bundle. Both
+forms use the same canonical skill directory and support the required local
+tools.
 
-本指南说明如何把 `assess-ontario-tenant-application` 作为一份可移植的 Agent
-Skills 包安装和运行。同一份包可用于 Codex、Claude Code、GitHub Copilot CLI，
-以及具备所需本地工具的其他 Agent Skills 兼容运行时。
+本指南说明如何把 `assess-ontario-tenant-application` 作为 Codex Agent Plugin
+或可移植 Agent Skills 包安装和运行。两种形式使用同一个权威 skill 目录，并依赖
+相同的本地工具。
 
 ## Scope / 适用范围
 
@@ -60,7 +60,44 @@ calculation step.
 
 ## Install / 安装
 
-### Recommended: one command / 推荐：一条命令
+### Agent Plugin / Agent 插件
+
+For Codex, clone the repository, define its plugin paths, register the
+repository marketplace, and install the plugin by its stable marketplace
+identity:
+
+对于 Codex，克隆仓库并定义插件路径，注册仓库 marketplace，然后通过稳定的
+marketplace 标识安装插件：
+
+```bash
+git clone https://github.com/thinkbold/skills.git
+cd skills
+export REPO_ROOT="$PWD"
+export PLUGIN_ROOT="$REPO_ROOT/plugins/assess-ontario-tenant-application"
+export SKILL_SOURCE="$PLUGIN_ROOT/skills/assess-ontario-tenant-application"
+test -f "$REPO_ROOT/.agents/plugins/marketplace.json"
+test -f "$PLUGIN_ROOT/.codex-plugin/plugin.json"
+test -f "$SKILL_SOURCE/SKILL.md"
+codex plugin marketplace add "$REPO_ROOT"
+codex plugin add assess-ontario-tenant-application@thinkbold-skills
+```
+
+Start a new Codex task after installation so the skill is discovered. This
+local repository installation does not publish the plugin to OpenAI's public
+plugin directory.
+
+安装后请新建一个 Codex 任务，使 skill 被正确发现。本地仓库安装不会把插件发布到
+OpenAI 的公共插件目录。
+
+Both installation forms resolve to the same canonical directory:
+`plugins/assess-ontario-tenant-application/skills/assess-ontario-tenant-application`.
+
+两种安装形式都指向同一个权威目录：
+`plugins/assess-ontario-tenant-application/skills/assess-ontario-tenant-application`。
+
+### Standalone Agent Skills / 独立 Agent Skills
+
+#### Recommended: one command / 推荐：一条命令
 
 Install globally, then choose one or more detected agents interactively:
 
@@ -109,7 +146,7 @@ export SKILL_SOURCE="/path/reported/by/skills-list/assess-ontario-tenant-applica
 test -f "$SKILL_SOURCE/SKILL.md"
 ```
 
-### Manual fallback / 手工安装 fallback
+#### Manual fallback / 手工安装 fallback
 
 Use this fallback when Node.js or npm is unavailable, when the installer cannot
 reach GitHub, or when organizational policy requires a reviewed local
@@ -121,7 +158,9 @@ checkout. Clone the repository and verify the canonical skill directory:
 ```bash
 git clone https://github.com/thinkbold/skills.git
 cd skills
-export SKILL_SOURCE="$PWD/assess-ontario-tenant-application"
+export REPO_ROOT="$PWD"
+export PLUGIN_ROOT="$REPO_ROOT/plugins/assess-ontario-tenant-application"
+export SKILL_SOURCE="$PLUGIN_ROOT/skills/assess-ontario-tenant-application"
 test -f "$SKILL_SOURCE/SKILL.md"
 ```
 
@@ -341,6 +380,23 @@ evidence support for a human decision, not a decision or legal opinion.
 
 ## Update / 更新
 
+For the Codex plugin, versioned releases are required. Every plugin-content release must change the `version` in
+`$PLUGIN_ROOT/.codex-plugin/plugin.json`. Do not reinstall changed plugin
+content under an unchanged version. Pull the versioned release, rerun the
+bundled tests, re-add the plugin, then start a new Codex task.
+
+对于 Codex 插件，每个包含插件内容的发布都必须更改
+`$PLUGIN_ROOT/.codex-plugin/plugin.json` 中的 `version`。不得在版本不变时重新
+安装已更改的插件内容。拉取已更新版本，重新运行随附测试并重新添加插件，然后新建一个 Codex 任务。
+
+```bash
+cd "$REPO_ROOT"
+git pull --ff-only
+PYTHONPATH="$SKILL_SOURCE" python3 -m unittest discover \
+  -s "$PLUGIN_ROOT/tests" -v
+codex plugin add assess-ontario-tenant-application@thinkbold-skills
+```
+
 For an installation managed by the recommended installer:
 
 如果使用推荐安装器管理 skill：
@@ -360,6 +416,17 @@ your approved file-management process.
 skill 目录内没有案件资料，再通过获准的文件管理流程替换副本。
 
 ## Uninstall / 卸载
+
+Remove the installed plugin first. Remove the marketplace only when no other
+plugin from `thinkbold-skills` is still needed:
+
+先卸载插件。只有在不再需要 `thinkbold-skills` 中任何其他插件时，才移除该
+marketplace：
+
+```bash
+codex plugin remove assess-ontario-tenant-application@thinkbold-skills
+codex plugin marketplace remove thinkbold-skills
+```
 
 For an installation managed by the recommended installer:
 
