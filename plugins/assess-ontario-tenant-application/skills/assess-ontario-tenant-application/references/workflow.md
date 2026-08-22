@@ -1,5 +1,8 @@
 # Operator Workflow
 
+The command examples assume `SKILL_SOURCE` points to the installed canonical
+skill directory.
+
 ## 1. Prepare One Case
 
 - Use one controlled case directory. If `case-manifest.json` is missing, follow
@@ -18,7 +21,7 @@
 Run:
 
 ```bash
-PYTHONPATH=assess-ontario-tenant-application python3 assess-ontario-tenant-application/scripts/validate_case.py CASE_DIR
+PYTHONPATH="$SKILL_SOURCE" python3 "$SKILL_SOURCE/scripts/validate_case.py" CASE_DIR
 ```
 
 If `can_extract` is false, return only the prerequisites listed in `outputs/preflight.json`. If `can_finalize` is false, extraction may continue but the final recommendation must remain insufficient.
@@ -52,7 +55,7 @@ Display a found item only after two independent non-protected identity matches. 
 After extraction, run:
 
 ```bash
-PYTHONPATH=assess-ontario-tenant-application python3 assess-ontario-tenant-application/scripts/run_pipeline.py CASE_DIR
+PYTHONPATH="$SKILL_SOURCE" python3 "$SKILL_SOURCE/scripts/run_pipeline.py" CASE_DIR
 ```
 
 The pipeline re-runs preflight, sanitizes evidence, calculates confirmed financial facts, derives bounded evidence states, and builds outputs.

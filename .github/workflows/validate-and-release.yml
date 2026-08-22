@@ -33,18 +33,19 @@ jobs:
 
       - name: Run unit tests
         env:
-          PYTHONPATH: assess-ontario-tenant-application
+          PYTHONPATH: plugins/assess-ontario-tenant-application/skills/assess-ontario-tenant-application
         run: >-
           python -m unittest discover
-          -s assess-ontario-tenant-application/tests
+          -s plugins/assess-ontario-tenant-application/tests
           -v
 
       - name: Compile bundled scripts
-        run: python -m compileall -q assess-ontario-tenant-application/scripts
+        run: python -m compileall -q plugins/assess-ontario-tenant-application/skills/assess-ontario-tenant-application/scripts
 
       - name: Validate JSON files
         run: >-
-          find assess-ontario-tenant-application -name '*.json' -type f -print0
+          find .agents/plugins plugins/assess-ontario-tenant-application
+          -name '*.json' -type f -print0
           | xargs -0 -n1 python -m json.tool
           > /dev/null
 
@@ -84,7 +85,8 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf \
-            dist/assess-ontario-tenant-application.tar.gz \
+            "$GITHUB_WORKSPACE/dist/assess-ontario-tenant-application.tar.gz" \
+            -C plugins/assess-ontario-tenant-application/skills \
             assess-ontario-tenant-application
           sha256sum \
             dist/assess-ontario-tenant-application.tar.gz \

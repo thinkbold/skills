@@ -15,6 +15,7 @@ def find_repo_root(start: Path) -> Path:
 
 REPO_ROOT = find_repo_root(Path(__file__).resolve())
 PLUGIN_ROOT = REPO_ROOT / "plugins" / PLUGIN_NAME
+SKILL_ROOT = PLUGIN_ROOT / "skills" / PLUGIN_NAME
 MANIFEST_PATH = PLUGIN_ROOT / ".codex-plugin" / "plugin.json"
 MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
 
@@ -24,6 +25,47 @@ def load_json(path: Path) -> dict:
 
 
 class PluginLayoutTests(unittest.TestCase):
+    def test_plugin_contains_the_only_canonical_skill(self) -> None:
+        required = [
+            "SKILL.md",
+            "scripts/init_case.py",
+            "scripts/run_pipeline.py",
+            "references/case-intake.md",
+            "references/workflow.md",
+            "assets/case-intake.template.json",
+            "assets/case-manifest.template.json",
+        ]
+        self.assertEqual(
+            [], [path for path in required if not (SKILL_ROOT / path).is_file()]
+        )
+        self.assertFalse((REPO_ROOT / PLUGIN_NAME / "SKILL.md").exists())
+
+    def test_repository_distribution_uses_nested_plugin_paths(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "validate-and-release.yml"
+        ).read_text(encoding="utf-8")
+        nested_skill = f"plugins/{PLUGIN_NAME}/skills/{PLUGIN_NAME}"
+
+        required_readme = [
+            f"{nested_skill}/USER_GUIDE.md",
+            "codex plugin marketplace add",
+            f"codex plugin add {PLUGIN_NAME}@thinkbold-skills",
+            "npx skills add thinkbold/skills",
+        ]
+        required_workflow = [
+            f"PYTHONPATH: {nested_skill}",
+            f"-s plugins/{PLUGIN_NAME}/tests",
+            f"python -m compileall -q {nested_skill}/scripts",
+            f"-C plugins/{PLUGIN_NAME}/skills",
+        ]
+        self.assertEqual(
+            [], [item for item in required_readme if item not in readme]
+        )
+        self.assertEqual(
+            [], [item for item in required_workflow if item not in workflow]
+        )
+
     def test_manifest_declares_the_skills_only_plugin(self) -> None:
         manifest = load_json(MANIFEST_PATH)
         self.assertEqual(PLUGIN_NAME, manifest["name"])

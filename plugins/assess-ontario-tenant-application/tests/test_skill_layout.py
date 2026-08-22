@@ -2,8 +2,10 @@ from pathlib import Path
 import unittest
 
 
-SKILL_ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY_ROOT = SKILL_ROOT.parent
+PLUGIN_NAME = "assess-ontario-tenant-application"
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+SKILL_ROOT = PLUGIN_ROOT / "skills" / PLUGIN_NAME
+REPOSITORY_ROOT = PLUGIN_ROOT.parents[1]
 
 
 class SkillLayoutTests(unittest.TestCase):
@@ -86,8 +88,20 @@ class SkillLayoutTests(unittest.TestCase):
             "--agent github-copilot",
         ]
         required_guide = [
+            "Agent Plugin / Agent 插件",
+            "Standalone Agent Skills / 独立 Agent Skills",
             "Recommended: one command / 推荐：一条命令",
             "Manual fallback / 手工安装 fallback",
+            ".agents/plugins/marketplace.json",
+            "plugins/assess-ontario-tenant-application/skills/assess-ontario-tenant-application",
+            "codex plugin marketplace add \"$REPO_ROOT\"",
+            "codex plugin add assess-ontario-tenant-application@thinkbold-skills",
+            "Every plugin-content release must change the `version`",
+            "每个包含插件内容的发布都必须更改",
+            "then start a new Codex task.",
+            "然后新建一个 Codex 任务。",
+            "codex plugin remove assess-ontario-tenant-application@thinkbold-skills",
+            "codex plugin marketplace remove thinkbold-skills",
             "npx skills update assess-ontario-tenant-application",
             "npx skills remove assess-ontario-tenant-application",
         ]
@@ -155,6 +169,15 @@ class SkillLayoutTests(unittest.TestCase):
         self.assertEqual(
             [], [name for name in names if f"references/{name}" not in text]
         )
+
+    def test_workflow_commands_use_the_canonical_skill_source(self) -> None:
+        text = (SKILL_ROOT / "references" / "workflow.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('PYTHONPATH="$SKILL_SOURCE"', text)
+        self.assertIn('"$SKILL_SOURCE/scripts/validate_case.py"', text)
+        self.assertIn('"$SKILL_SOURCE/scripts/run_pipeline.py"', text)
+        self.assertNotIn("PYTHONPATH=assess-ontario-tenant-application", text)
 
     def test_policy_references_cover_high_risk_boundaries(self) -> None:
         paths = {
