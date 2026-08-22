@@ -81,6 +81,13 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@v4
 
+      - name: Verify release tag matches plugin version
+        run: >-
+          python3 tools/validate_plugin_release.py
+          --manifest plugins/assess-ontario-tenant-application/.codex-plugin/plugin.json
+          --tag "$GITHUB_REF_NAME"
+          --tag-prefix "assess-ontario-tenant-application-v"
+
       - name: Build versioned skill archive
         run: |
           mkdir -p dist
