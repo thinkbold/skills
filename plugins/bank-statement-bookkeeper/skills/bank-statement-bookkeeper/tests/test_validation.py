@@ -139,10 +139,42 @@ class ValidationTests(unittest.TestCase):
             "posting_date": "2026-01-03", "inflow": "10", "outflow": "0", "running_balance": "10",
             "classification_status": "unclassified", "source_file": "synthetic.csv", "source_page_or_row": "2",
         })
-        orphaned = {**malformed, "transaction_id": "orphaned", "currency": "CAD", "raw_description": "", "inflow": "10"}
+        orphaned = {**malformed, "transaction_id": "orphaned", "currency": "CAD", "raw_description": "!!!", "inflow": "10"}
         from bookkeeper.validation import count_pending_classifications, validate_canonical_transactions
         self.assertIn("CURRENCY_MISSING", {issue.code for issue in validate_canonical_transactions((malformed,))})
         self.assertEqual(1, count_pending_classifications((orphaned,)))
+
+    def test_full_canonical_contract_rejects_structure_status_and_provenance(self) -> None:
+        """Catches malformed schema/status/provenance rows bypassing final validation."""
+        from bookkeeper.validation import validate_canonical_transactions
+        complete = {field: "x" for field in CANONICAL_TRANSACTION_FIELDS}
+        complete.update({"transaction_id": "row-1", "account_id": "checking", "currency": "CAD", "transaction_date": "2026-01-03", "posting_date": "2026-01-03", "raw_description": "Synthetic", "inflow": "10", "outflow": "0", "running_balance": "10", "source_file": "synthetic.csv", "source_page_or_row": "2", "classification_status": "bogus", "account_name": ""})
+        malformed = {key: value for key, value in complete.items() if key != "source_page_or_row"}
+        self.assertIn("CANONICAL_STATUS_INVALID", {issue.code for issue in validate_canonical_transactions((complete,))})
+        self.assertIn("CANONICAL_SCHEMA_INVALID", {issue.code for issue in validate_canonical_transactions((malformed,))})
+
+    def test_final_cli_blocks_bogus_status_and_nan_without_unexpected_error(self) -> None:
+        """Catches exact-rule Decimal parsing occurring before canonical validation."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            for status, inflow in (("bogus", "10"), ("unclassified", "NaN")):
+                row = {field: "" for field in CANONICAL_TRANSACTION_FIELDS}
+                row.update({"transaction_id": f"row-{status}", "account_id": "checking", "currency": "CAD", "transaction_date": "2026-01-03", "posting_date": "2026-01-03", "raw_description": "Synthetic", "inflow": inflow, "outflow": "0", "running_balance": "10", "source_file": "synthetic.csv", "source_page_or_row": "2", "classification_status": status, "source_locations": "synthetic.csv:2"})
+                atomic_write_csv(ledger / "work" / "normalized-transactions.csv", CANONICAL_TRANSACTION_FIELDS, (row,))
+                result = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("blocked", json.loads(result.stdout)["state"])
+
+    def test_exception_sources_are_opaque(self) -> None:
+        """Catches caller supplied account, filename, or location text escaping exceptions.csv."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            finalize_outputs(ledger, has_transactions=False, pending_group_count=0, reconciliation_rows=(), issues=(Issue("PDF_PAGE_EMPTY", "checking-001 123456", True, "statement-123456.pdf", "checking-001:page 2"),))
+            text = (ledger / "outputs" / "exceptions.csv").read_text(encoding="utf-8")
+            for secret in ("checking-001", "123456", "statement-123456.pdf", "page 2"):
+                self.assertNotIn(secret, text)
 
     def test_active_import_issue_blocks_final_status_until_the_same_source_succeeds(self) -> None:
         """Catches an import failure being forgotten before final ledger validation."""
