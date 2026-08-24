@@ -17,6 +17,7 @@ from bookkeeper.reconciliation import (
     derive_opening_from_prior_statement,
     reconcile_account_period,
     reconcile_all,
+    load_balance_rows,
     validate_period_continuity,
     write_reconciliation_outputs,
 )
@@ -153,6 +154,64 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(row.reconciled)
         self.assertIn("BALANCE_UNCONFIRMED", {issue.code for issue in row.issues})
 
+    def test_prior_opening_requires_a_distinct_confirmed_predecessor_row(self) -> None:
+        """Catches a current row self-certifying a fabricated prior-year statement date."""
+        rows = reconcile_all(
+            (transaction("checking-001", "CAD", "2026-01-03", "10.00", "0"),),
+            (balance(
+                opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31",
+                opening_balance="100.00", closing_balance="110.00",
+            ),),
+        )
+        self.assertFalse(rows[0].reconciled)
+        self.assertIn("OPENING_BALANCE_MISSING", {issue.code for issue in rows[0].issues})
+
+    def test_prior_opening_is_derived_from_a_confirmed_matching_predecessor(self) -> None:
+        """Catches a valid predecessor balance being ignored or counted as another currency."""
+        rows = reconcile_all(
+            (transaction("checking-001", "CAD", "2026-01-03", "10.00", "0"),),
+            (
+                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="100.00", opening_source_type="user_provided"),
+                balance(opening_balance="", closing_balance="110.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
+            ),
+        )
+        current = next(row for row in rows if row.period_start == "2026-01-01")
+        self.assertEqual(Decimal("100.00"), current.opening_balance)
+        self.assertTrue(current.reconciled)
+
+    def test_prior_opening_mismatch_or_unconfirmed_predecessor_cannot_reconcile(self) -> None:
+        """Catches contradictory or unconfirmed predecessor evidence being trusted."""
+        mismatch = reconcile_all(
+            (), (
+                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="100.00"),
+                balance(opening_balance="99.00", closing_balance="99.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
+            ),
+        )
+        unconfirmed = reconcile_all(
+            (), (
+                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="100.00", confirmed="false"),
+                balance(opening_balance="", closing_balance="100.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
+            ),
+        )
+        mismatch_current = next(row for row in mismatch if row.period_start == "2026-01-01")
+        unconfirmed_current = next(row for row in unconfirmed if row.period_start == "2026-01-01")
+        self.assertTrue(any(issue.blocking for issue in mismatch_current.issues))
+        self.assertIn("OPENING_BALANCE_MISSING", {issue.code for issue in unconfirmed_current.issues})
+
+    def test_truncated_and_overlong_balance_csv_are_blocking_not_unexpected(self) -> None:
+        """Catches DictReader None cells escaping balance schema validation."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            path = ledger / "inputs" / "account-balances.csv"
+            header = ",".join(BALANCE_FIELDS)
+            path.write_text(header + "\n" + ",".join(("checking", "CAD")) + "\n", encoding="utf-8")
+            _, truncated = load_balance_rows(ledger)
+            path.write_text(header + "\n" + ",".join(("checking", "CAD") + ("x",) * len(BALANCE_FIELDS)) + "\n", encoding="utf-8")
+            _, overlong = load_balance_rows(ledger)
+            self.assertEqual("BALANCE_SCHEMA_INVALID", truncated[0].code)
+            self.assertEqual("BALANCE_SCHEMA_INVALID", overlong[0].code)
+
     def test_reconcile_all_keeps_cad_and_usd_independent(self) -> None:
         """Catches netting different currencies together when reconciling a shared account."""
         rows = reconcile_all(
@@ -168,8 +227,8 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual({("checking-001", "CAD"), ("checking-001", "USD")}, {(row.account_id, row.currency) for row in rows})
         self.assertTrue(all(row.reconciled for row in rows))
 
-    def test_balance_evidence_uses_its_prior_statement_date_for_derived_opening(self) -> None:
-        """Catches a confirmed prior-year opening being compared to the current period end."""
+    def test_prior_source_date_without_predecessor_row_remains_pending(self) -> None:
+        """Catches a current balance row impersonating its missing predecessor statement."""
         row = reconcile_all(
             (transaction("checking-001", "CAD", "2026-01-03", "10.00", "0"),),
             (balance(
@@ -177,7 +236,8 @@ class ReconciliationTests(unittest.TestCase):
                 opening_balance="100.00", closing_balance="110.00",
             ),),
         )[0]
-        self.assertTrue(row.reconciled)
+        self.assertFalse(row.reconciled)
+        self.assertIn("OPENING_BALANCE_MISSING", {issue.code for issue in row.issues})
         self.assertEqual("2025-12-31", row.opening_source_date)
 
     def test_transaction_outside_statement_coverage_is_blocking(self) -> None:

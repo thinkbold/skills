@@ -175,3 +175,54 @@ def append_audit_event(
         handle.flush()
         os.fsync(handle.fileno())
     return event_id
+
+
+_ACTIVE_ISSUES_PATH = Path("work") / "active-issues.json"
+
+
+def _active_issue_key(stage: str, scope: Mapping[str, object]) -> str:
+    encoded = json.dumps({"stage": stage, "scope": dict(scope)}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def replace_active_issues(ledger_root: Path, stage: str, scope: Mapping[str, object], issues: Iterable[object]) -> None:
+    """Atomically replace one operation's sanitized current issue set."""
+    path = resolve_inside_ledger(ledger_root, _ACTIVE_ISSUES_PATH)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        payload = {"entries": [], "version": 1}
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        raise ValueError("active issue registry is invalid")
+    key = _active_issue_key(stage, scope)
+    entries = [entry for entry in payload["entries"] if isinstance(entry, dict) and entry.get("key") != key]
+    sanitized = []
+    for issue in issues:
+        code = str(getattr(issue, "code", ""))
+        if code:
+            sanitized.append({"blocking": bool(getattr(issue, "blocking", True)), "code": code})
+    if sanitized:
+        entries.append({"issues": sorted(sanitized, key=lambda item: item["code"]), "key": key, "stage": stage})
+    atomic_write_json(path, {"entries": sorted(entries, key=lambda item: str(item.get("key", ""))), "version": 1})
+
+
+def load_active_issues(ledger_root: Path):
+    """Return only safe code-based issue objects from the active ledger registry."""
+    from .contracts import Issue
+    path = resolve_inside_ledger(ledger_root, _ACTIVE_ISSUES_PATH)
+    if not path.exists():
+        return ()
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
+        raise ValueError("active issue registry is invalid")
+    issues = []
+    for entry in payload["entries"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("issues"), list):
+            raise ValueError("active issue registry is invalid")
+        for item in entry["issues"]:
+            if not isinstance(item, dict) or not isinstance(item.get("code"), str) or not item["code"]:
+                raise ValueError("active issue registry is invalid")
+            issues.append(Issue(item["code"], f"Active ledger issue: {item['code']}", bool(item.get("blocking", True))))
+    return tuple(issues)

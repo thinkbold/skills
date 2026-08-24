@@ -23,6 +23,7 @@ from bookkeeper.classification import (
     save_transactions,
 )
 from bookkeeper.storage import read_audit_events
+from bookkeeper.storage import replace_active_issues
 
 
 def _json(value: object) -> None:
@@ -32,6 +33,7 @@ def _json(value: object) -> None:
 def _current(ledger: Path):
     rows = load_transactions(ledger)
     result = apply_exact_rules(rows, load_rules(ledger))
+    replace_active_issues(ledger, "classification", {"view": "current"}, result.issues)
     save_transactions(ledger, result.transactions)
     return result
 

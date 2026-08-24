@@ -131,6 +131,42 @@ class ValidationTests(unittest.TestCase):
                     self.assertEqual(3, result.returncode)
                     self.assertFalse((outside / "outputs").exists())
 
+    def test_invalid_canonical_rows_block_and_orphaned_unclassified_rows_stay_pending(self) -> None:
+        """Catches malformed rows disappearing or blank descriptions bypassing classification pending."""
+        malformed = {field: "" for field in CANONICAL_TRANSACTION_FIELDS}
+        malformed.update({
+            "transaction_id": "bad", "account_id": "checking", "currency": "", "transaction_date": "2026-01-03",
+            "posting_date": "2026-01-03", "inflow": "10", "outflow": "0", "running_balance": "10",
+            "classification_status": "unclassified", "source_file": "synthetic.csv", "source_page_or_row": "2",
+        })
+        orphaned = {**malformed, "transaction_id": "orphaned", "currency": "CAD", "raw_description": "", "inflow": "10"}
+        from bookkeeper.validation import count_pending_classifications, validate_canonical_transactions
+        self.assertIn("CURRENCY_MISSING", {issue.code for issue in validate_canonical_transactions((malformed,))})
+        self.assertEqual(1, count_pending_classifications((orphaned,)))
+
+    def test_active_import_issue_blocks_final_status_until_the_same_source_succeeds(self) -> None:
+        """Catches an import failure being forgotten before final ledger validation."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            (ledger / "work" / "mapping.json").write_text(json.dumps({
+                "transaction_date": "Date", "description": "Description", "debit": "Debit", "credit": "Credit", "balance": "Balance", "reference": "Reference",
+            }), encoding="utf-8")
+            (ledger / "work" / "account.json").write_text(json.dumps({
+                "account_id": "checking", "institution": "Synthetic", "masked_label": "********9012", "currency": "CAD",
+            }), encoding="utf-8")
+            statement = ledger / "inputs" / "statement.csv"
+            statement.write_text("Date,Description,Debit,Balance,Reference\n2026-01-03,Synthetic,0,110,ref\n", encoding="utf-8")
+            failed = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"), "csv", str(ledger), "inputs/statement.csv", "--mapping", "work/mapping.json", "--account", "work/account.json"], capture_output=True, text=True)
+            blocked = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
+            statement.write_text("Date,Description,Debit,Credit,Balance,Reference\n2026-01-03,Synthetic,0,10,110,ref\n", encoding="utf-8")
+            succeeded = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"), "csv", str(ledger), "inputs/statement.csv", "--mapping", "work/mapping.json", "--account", "work/account.json"], capture_output=True, text=True)
+            cleared = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
+            self.assertEqual(2, failed.returncode)
+            self.assertEqual("blocked", json.loads(blocked.stdout)["state"])
+            self.assertEqual(0, succeeded.returncode, succeeded.stderr)
+            self.assertNotEqual("blocked", json.loads(cleared.stdout)["state"])
+
 
 if __name__ == "__main__":
     unittest.main()

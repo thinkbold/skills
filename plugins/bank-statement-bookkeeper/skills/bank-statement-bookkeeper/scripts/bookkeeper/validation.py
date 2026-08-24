@@ -6,6 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Iterable, Mapping
+from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from .contracts import Issue, RunState
 from .reconciliation import ReconciliationRow
@@ -22,6 +24,39 @@ _BLOCKING_CODES = frozenset({
     "UNRESOLVED_DUPLICATE_CANDIDATE", "CHART_REFERENCE_INVALID",
 })
 _EXCEPTION_FIELDS = ("code", "blocking", "message", "source_file", "source_location")
+
+
+def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[Issue, ...]:
+    """Block malformed canonical rows before grouping or reconciliation can omit them."""
+    issues: list[Issue] = []
+    for index, row in enumerate(transactions, start=1):
+        account_id, currency = str(row.get("account_id") or "").strip(), str(row.get("currency") or "").strip()
+        if not account_id:
+            issues.append(Issue("ACCOUNT_UNCONFIRMED", "Canonical transaction account is missing.", True, source_location=str(index)))
+        if not currency:
+            issues.append(Issue("CURRENCY_MISSING", "Canonical transaction currency is missing.", True, source_location=str(index)))
+        try:
+            date.fromisoformat(str(row.get("transaction_date") or "")); date.fromisoformat(str(row.get("posting_date") or ""))
+        except ValueError:
+            issues.append(Issue("DATE_UNPARSEABLE", "Canonical transaction date is invalid.", True, source_location=str(index)))
+        try:
+            inflow, outflow, balance = (Decimal(str(row.get(field) or "")) for field in ("inflow", "outflow", "running_balance"))
+            if not all(value.is_finite() for value in (inflow, outflow, balance)) or not ((inflow > 0 and outflow == 0) or (outflow > 0 and inflow == 0)):
+                raise InvalidOperation
+        except (InvalidOperation, ValueError):
+            issues.append(Issue("AMOUNT_DIRECTION_AMBIGUOUS", "Canonical transaction amount direction is invalid.", True, source_location=str(index)))
+    return tuple(issues)
+
+
+def count_pending_classifications(transactions: Iterable[Mapping[str, object]]) -> int:
+    """Count every otherwise valid unclassified row, even if it cannot form a merchant group."""
+    total = 0
+    for row in transactions:
+        if str(row.get("classification_status") or "") != "unclassified":
+            continue
+        if not validate_canonical_transactions((row,)):
+            total += 1
+    return total
 
 
 def determine_run_state(
@@ -65,7 +100,7 @@ def _masked_message(message: str, account_labels: Mapping[str, str] | None) -> s
     if not account_labels:
         return message
     masked = message
-    for account_id, label in account_labels.items():
+    for account_id, label in sorted(account_labels.items(), key=lambda item: -len(item[0])):
         masked = masked.replace(account_id, label)
     return masked
 
@@ -80,11 +115,13 @@ def finalize_outputs(
     account_labels: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Write stable masked exceptions and status after deterministic state selection."""
+    generated_labels = {row.account_id: f"account-{hashlib.sha256(row.account_id.encode('utf-8')).hexdigest()[:12]}" for row in reconciliation_rows}
+    labels = {**generated_labels, **(dict(account_labels) if account_labels else {})}
     all_issues = collect_ledger_issues(issues, reconciliation_rows, pending_group_count)
     state = determine_run_state(has_transactions, pending_group_count, reconciliation_rows, all_issues)
     exceptions = [{
         "code": issue.code, "blocking": str(issue.blocking).lower(),
-        "message": _masked_message(issue.message, account_labels), "source_file": issue.source_file,
+        "message": _masked_message(issue.message, labels), "source_file": issue.source_file,
         "source_location": issue.source_location,
     } for issue in all_issues]
     outputs = resolve_inside_ledger(ledger_root, "outputs")
