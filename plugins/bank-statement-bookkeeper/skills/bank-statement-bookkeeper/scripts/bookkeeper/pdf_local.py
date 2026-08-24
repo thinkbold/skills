@@ -9,8 +9,8 @@ import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any, Callable
 import re
+from typing import Any, Callable
 
 from .contracts import AccountContext, ImportResult, Issue
 from .importing import CsvMapping, parse_decimal, serialize_decimal
@@ -39,7 +39,6 @@ class PdfExtraction:
     staged_pdf: Path | None = None
 
 
-PdfReader = Any
 OcrRunner = Callable[[Path, Path, str], Path]
 _MASKED_LABEL = re.compile(r"^\*+[^\d]*\d{4}$")
 
@@ -56,9 +55,7 @@ def _issue(code: str, message: str, source: Path, location: str = "") -> Issue:
     return Issue(code, message, source_file=source.name, source_location=location)
 
 
-def _load_reader(reader: PdfReader | None) -> PdfReader:
-    if reader is not None:
-        return reader
+def _load_reader() -> Any:
     import pdfplumber
 
     return pdfplumber
@@ -114,7 +111,6 @@ def extract_pdf_pages(
     capabilities: PdfCapabilities | None = None,
     *,
     ocr_runner: OcrRunner | None = None,
-    pdf_reader: PdfReader | None = None,
 ) -> PdfExtraction:
     """Extract each page locally and OCR only image-only PDFs into the ledger work area."""
     source = Path(source)
@@ -124,7 +120,7 @@ def extract_pdf_pages(
             "PDF_LIBRARY_UNAVAILABLE", "Local PDF extraction requires the configured PDF library.", source,
         ),))
     try:
-        reader = _load_reader(pdf_reader)
+        reader = _load_reader()
         pages = _read_pages(source, reader)
     except Exception as error:  # The third-party parser controls its exception hierarchy.
         code = "PDF_ENCRYPTED" if _is_encrypted(error) else "PDF_PAGE_EMPTY"
@@ -165,7 +161,9 @@ def _mapping_headers(mapping: CsvMapping) -> tuple[str, ...]:
 
 
 def _account_issue(account: AccountContext) -> Issue | None:
-    if not all((account.account_id, account.institution, account.masked_label, account.currency)):
+    if not account.currency.strip():
+        return Issue("CURRENCY_MISSING", "A currency is required for each import.")
+    if not all((account.account_id, account.institution, account.masked_label)):
         return Issue("ACCOUNT_UNCONFIRMED", "A confirmed account context is required.")
     if not _MASKED_LABEL.fullmatch(account.masked_label):
         return Issue("ACCOUNT_UNCONFIRMED", "Account labels must be explicitly masked before import.")
@@ -235,6 +233,7 @@ def map_pdf_tables(
     account: AccountContext,
     *,
     source_file: str,
+    source_hash: str,
 ) -> ImportResult:
     """Map only exact confirmed PDF table headers to canonical rows with page provenance."""
     if extraction.issues:
@@ -243,7 +242,6 @@ def map_pdf_tables(
     if account_issue is not None:
         return ImportResult(issues=(account_issue,))
     headers = _mapping_headers(mapping)
-    source_hash = hashlib.sha256(source_file.encode("utf-8")).hexdigest()
     rows: list[dict[str, str]] = []
     issues: list[Issue] = []
     matched_table = False

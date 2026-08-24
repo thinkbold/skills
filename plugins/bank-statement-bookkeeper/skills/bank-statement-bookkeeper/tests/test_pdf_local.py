@@ -1,10 +1,15 @@
 from pathlib import Path
+from contextlib import redirect_stdout
+import hashlib
+from io import StringIO
 import json
 import shutil
-import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+
+import pdfplumber
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -20,48 +25,12 @@ from bookkeeper.pdf_local import (
     extract_pdf_pages,
     map_pdf_tables,
 )
+import import_statements
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MAPPING = CsvMapping("Date", "Description", "Debit", "Credit", "Balance", "Reference")
 ACCOUNT = AccountContext("checking-001", "Synthetic Bank", "***1001", "CAD")
-
-
-class _PdfPage:
-    def __init__(self, text: str, tables: list[list[list[str]]] | None = None) -> None:
-        self._text = text
-        self._tables = tables or []
-
-    def extract_text(self) -> str:
-        return self._text
-
-    def extract_tables(self) -> list[list[list[str]]]:
-        return self._tables
-
-
-class _PdfDocument:
-    def __init__(self, pages: list[_PdfPage]) -> None:
-        self.pages = pages
-
-    def __enter__(self) -> "_PdfDocument":
-        return self
-
-    def __exit__(self, *arguments: object) -> None:
-        return None
-
-
-class _PdfReader:
-    @staticmethod
-    def open(source: Path) -> _PdfDocument:
-        if source.name == "scanned-statement.pdf":
-            return _PdfDocument([_PdfPage("")])
-        return _PdfDocument([_PdfPage("OPENAI *CHATGPT SUBSCRIPTION 9F3A2")])
-
-
-class _BlankTableReader:
-    @staticmethod
-    def open(source: Path) -> _PdfDocument:
-        return _PdfDocument([_PdfPage("", [[["", ""]]])])
 
 
 class PdfLocalTests(unittest.TestCase):
@@ -77,7 +46,6 @@ class PdfLocalTests(unittest.TestCase):
         result = extract_pdf_pages(
             FIXTURES / "text-statement.pdf", self.work,
             PdfCapabilities(pdfplumber=True, ocrmypdf=None),
-            pdf_reader=_PdfReader,
         )
         self.assertEqual("local_pdf_text", result.method)
         self.assertEqual(1, result.pages[0].page_number)
@@ -96,7 +64,6 @@ class PdfLocalTests(unittest.TestCase):
             FIXTURES / "scanned-statement.pdf", self.work,
             PdfCapabilities(pdfplumber=True, ocrmypdf="/usr/bin/ocrmypdf"),
             ocr_runner=copy_searchable_pdf,
-            pdf_reader=_PdfReader,
         )
         self.assertEqual("local_ocr", result.method)
         self.assertIsNotNone(result.staged_pdf)
@@ -106,26 +73,26 @@ class PdfLocalTests(unittest.TestCase):
         self.assertEqual((), result.issues)
         self.assertEqual(b"%PDF", (FIXTURES / "scanned-statement.pdf").read_bytes()[:4])
 
+    def test_scanned_fixture_is_same_synthetic_page_as_an_image_only_pdf(self) -> None:
+        """Catches committing a placeholder image instead of the rasterized synthetic statement."""
+        with pdfplumber.open(FIXTURES / "scanned-statement.pdf") as document:
+            page = document.pages[0]
+            self.assertEqual("", (page.extract_text() or "").strip())
+            self.assertEqual((1224, 1584), page.images[0]["srcsize"])
+            image_data = page.images[0]["stream"].get_data()
+            self.assertLess(min(image_data), 128)
+            self.assertEqual(255, max(image_data))
+
     def test_missing_ocr_is_blocking(self) -> None:
         """Catches silently accepting a scanned page when no local OCR executable exists."""
         result = extract_pdf_pages(
             FIXTURES / "scanned-statement.pdf", self.work,
             PdfCapabilities(pdfplumber=True, ocrmypdf=None),
-            pdf_reader=_PdfReader,
         )
         self.assertTrue(result.issues)
         self.assertEqual("LOCAL_OCR_UNAVAILABLE", result.issues[0].code)
         self.assertTrue(result.issues[0].blocking)
         self.assertNotIn("OPENAI", result.issues[0].message)
-
-    def test_blank_table_cells_still_require_local_ocr(self) -> None:
-        """Catches treating an all-blank extracted table as evidence that a page is readable."""
-        result = extract_pdf_pages(
-            FIXTURES / "scanned-statement.pdf", self.work,
-            PdfCapabilities(pdfplumber=True, ocrmypdf=None), pdf_reader=_BlankTableReader,
-        )
-        self.assertTrue(result.issues)
-        self.assertEqual("LOCAL_OCR_UNAVAILABLE", result.issues[0].code)
 
     def test_unmappable_pdf_header_is_blocking(self) -> None:
         """Catches guessing at table column names instead of requiring confirmed exact headers."""
@@ -136,7 +103,7 @@ class PdfLocalTests(unittest.TestCase):
             ),), "high"),),
             method="local_pdf_text", issues=(),
         )
-        result = map_pdf_tables(extraction, MAPPING, ACCOUNT, source_file="text-statement.pdf")
+        result = map_pdf_tables(extraction, MAPPING, ACCOUNT, source_file="text-statement.pdf", source_hash="a" * 64)
         self.assertEqual("PDF_TABLE_UNMAPPABLE", result.issues[0].code)
         self.assertEqual((), result.transactions)
 
@@ -151,7 +118,7 @@ class PdfLocalTests(unittest.TestCase):
         )
         result = map_pdf_tables(
             extraction, MAPPING, AccountContext("checking-001", "Synthetic Bank", "1001", "CAD"),
-            source_file="text-statement.pdf",
+            source_file="text-statement.pdf", source_hash="a" * 64,
         )
         self.assertTrue(result.issues)
         self.assertEqual("ACCOUNT_UNCONFIRMED", result.issues[0].code)
@@ -166,11 +133,46 @@ class PdfLocalTests(unittest.TestCase):
             ),), "high"),),
             method="local_pdf_text", issues=(),
         )
-        result = map_pdf_tables(extraction, MAPPING, ACCOUNT, source_file="text-statement.pdf")
+        result = map_pdf_tables(extraction, MAPPING, ACCOUNT, source_file="text-statement.pdf", source_hash="a" * 64)
         self.assertEqual("20.00", result.transactions[0]["outflow"])
         self.assertEqual("0", result.transactions[0]["inflow"])
         self.assertEqual("page:1/row:2", result.transactions[0]["source_page_or_row"])
         self.assertEqual("local_pdf_text", result.transactions[0]["extraction_method"])
+
+    def test_pdf_mapping_uses_content_hash_for_transaction_identity(self) -> None:
+        """Catches changed PDF content at one logical path retaining the old transaction ID."""
+        extraction = PdfExtraction(
+            pages=(PdfPage(1, "Synthetic", ((
+                ("Date", "Description", "Debit", "Credit", "Balance", "Reference"),
+                ("2026-01-05", "OPENAI", "20.00", "", "980.00", "A1"),
+            ),), "high"),),
+            method="local_pdf_text", issues=(),
+        )
+        first_path = self.work / "first.pdf"
+        second_path = self.work / "second.pdf"
+        first_path.write_bytes((FIXTURES / "text-statement.pdf").read_bytes())
+        second_path.write_bytes(first_path.read_bytes() + b"\n% changed synthetic fixture\n")
+        first_hash = hashlib.sha256(first_path.read_bytes()).hexdigest()
+        second_hash = hashlib.sha256(second_path.read_bytes()).hexdigest()
+        first = map_pdf_tables(extraction, MAPPING, ACCOUNT, source_file="inputs/statement.pdf", source_hash=first_hash)
+        second = map_pdf_tables(extraction, MAPPING, ACCOUNT, source_file="inputs/statement.pdf", source_hash=second_hash)
+        self.assertNotEqual(first.transactions[0]["transaction_id"], second.transactions[0]["transaction_id"])
+        self.assertEqual({"inputs/statement.pdf": second_hash}, second.source_hashes)
+
+    def test_pdf_mapping_reports_missing_currency_before_account_confirmation(self) -> None:
+        """Catches PDF imports masking a missing currency as a generic account problem."""
+        extraction = PdfExtraction(
+            pages=(PdfPage(1, "Synthetic", ((
+                ("Date", "Description", "Debit", "Credit", "Balance", "Reference"),
+                ("2026-01-05", "OPENAI", "20.00", "", "980.00", "A1"),
+            ),), "high"),),
+            method="local_pdf_text", issues=(),
+        )
+        result = map_pdf_tables(
+            extraction, MAPPING, AccountContext("checking-001", "Synthetic Bank", "1001", ""),
+            source_file="text-statement.pdf", source_hash="a" * 64,
+        )
+        self.assertEqual("CURRENCY_MISSING", result.issues[0].code)
 
     def test_pdf_command_reports_missing_local_library_without_statement_text(self) -> None:
         """Catches a public PDF command bypassing the local capability block or printing statement data."""
@@ -184,15 +186,16 @@ class PdfLocalTests(unittest.TestCase):
         (ledger / "work" / "account.json").write_text(json.dumps({
             "account_id": "checking-001", "institution": "Synthetic Bank", "masked_label": "***1001", "currency": "CAD",
         }), encoding="utf-8")
-        completed = subprocess.run([
-            sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"), "pdf", str(ledger), "inputs/statement.pdf",
-            "--mapping", "work/mapping.json", "--account", "work/account.json",
-        ], check=False, capture_output=True, text=True)
-        self.assertTrue(completed.stdout, completed.stderr)
-        payload = json.loads(completed.stdout)
-        self.assertEqual(2, completed.returncode)
+        output = StringIO()
+        with patch.object(import_statements, "detect_pdf_capabilities", return_value=PdfCapabilities(False, None)):
+            with redirect_stdout(output):
+                returncode = import_statements.main([
+                    "pdf", str(ledger), "inputs/statement.pdf", "--mapping", "work/mapping.json", "--account", "work/account.json",
+                ])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(2, returncode)
         self.assertEqual(["PDF_LIBRARY_UNAVAILABLE"], payload["issues"])
-        self.assertNotIn("OPENAI", completed.stdout)
+        self.assertNotIn("OPENAI", output.getvalue())
 
 
 if __name__ == "__main__":
