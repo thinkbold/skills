@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult
@@ -104,6 +106,43 @@ def _ledger_input(ledger_root: Path, requested: Path) -> tuple[Path, str]:
     return source, source.relative_to(ledger_root).as_posix()
 
 
+def _ledger_external_result(ledger_root: Path, selected_root: Path, requested: Path) -> Path:
+    """Return a real ledger-local result path without following any symlink component."""
+    if selected_root.resolve(strict=True) != ledger_root:
+        raise ValueError("selected ledger root does not match its canonical path")
+    candidate = selected_root / requested
+    relative = None
+    walk_root = None
+    for candidate_root in (selected_root, ledger_root):
+        try:
+            relative = candidate.relative_to(candidate_root)
+            walk_root = candidate_root
+            break
+        except ValueError:
+            continue
+    if relative is None or walk_root is None:
+        raise ValueError("external result is outside the selected ledger")
+    if not relative.parts or ".." in relative.parts:
+        raise ValueError("external result must identify a file")
+    current = walk_root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError as error:
+            raise ValueError("external result does not exist") from error
+        if stat.S_ISLNK(mode):
+            raise ValueError("external result path contains a symlink")
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(mode):
+            raise ValueError("external result ancestor is not a directory")
+        if index == len(relative.parts) - 1 and not stat.S_ISREG(mode):
+            raise ValueError("external result is not a regular file")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_relative_to(ledger_root) or not resolved.is_file():
+        raise ValueError("external result is not a real file inside the selected ledger")
+    return resolved
+
+
 def _candidate_from_csv(source: Path, source_identity: str) -> StatementInventory:
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
         first = next(csv.DictReader(handle), {})
@@ -143,7 +182,22 @@ def _record_import(
     if previous_hashes.get(source_identity) == source_hash:
         merged = ImportResult(transactions=existing, source_hashes=previous_hashes)
     else:
-        retained = tuple(row for row in existing if row["source_file"] != source_identity)
+        retained_rows = []
+        source_location_prefix = f"{source_identity}:"
+        for source in existing:
+            if source["source_file"] == source_identity:
+                continue
+            row = dict(source)
+            locations = [
+                location
+                for location in row["source_locations"].split("|")
+                if location and not location.startswith(source_location_prefix)
+            ]
+            if not locations:
+                raise ValueError("retained transaction lost all source provenance")
+            row["source_locations"] = "|".join(locations)
+            retained_rows.append(row)
+        retained = tuple(retained_rows)
         merged = merge_import_results((ImportResult(transactions=retained, source_hashes=previous_hashes), result))
     classified = apply_exact_rules(merged.transactions, load_rules(ledger_root))
     atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, classified.transactions)
@@ -239,9 +293,8 @@ def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, ob
 
 
 def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
-    result_path = resolve_inside_ledger(ledger_root, args.result)
-    if not result_path.is_file():
-        raise ValueError("external result must be a real file inside the selected ledger")
+    selected_root = Path(os.path.abspath(os.fspath(args.ledger_dir)))
+    result_path = _ledger_external_result(ledger_root, selected_root, args.result)
     result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, result_path)
     replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, result.issues)
     if result.issues:
