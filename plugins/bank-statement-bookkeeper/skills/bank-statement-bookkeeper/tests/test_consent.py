@@ -114,11 +114,11 @@ class ConsentTests(unittest.TestCase):
 
         output = StringIO()
         with redirect_stdout(output):
-            self.assertEqual(2, import_statements.main([
+            self.assertEqual(3, import_statements.main([
                 "record-consent", str(self.ledger), "work/proposal.json", "--decision", "authorized", "--actor", "user",
             ]))
 
-        self.assertIn("operation_id", json.loads(output.getvalue())["error"])
+        self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(output.getvalue())["error"])
         self.assertEqual(1, len(read_audit_events(self.ledger)))
 
     def test_declined_work_is_rejected_before_result_is_read(self) -> None:
@@ -291,9 +291,9 @@ class ConsentTests(unittest.TestCase):
             self.assertEqual(0, import_statements.main([
                 "record-consent", str(self.ledger), "work/proposal.json", "--decision", "authorized", "--actor", "user",
             ]))
-        consent_records = [json.loads(line) for line in consent_output.getvalue().splitlines()]
-        self.assertEqual(disclosed, consent_records[0]["disclosure"])
-        consent_id = consent_records[1]["consent_id"]
+        consent_record = json.loads(consent_output.getvalue())
+        self.assertEqual(disclosed, consent_record["disclosure"])
+        consent_id = consent_record["consent_id"]
         result_output = StringIO()
         with redirect_stdout(result_output):
             self.assertEqual(0, import_statements.main([

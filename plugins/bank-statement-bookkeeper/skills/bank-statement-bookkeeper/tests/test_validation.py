@@ -255,7 +255,7 @@ class ValidationTests(unittest.TestCase):
             statement.write_text("Date,Description,Debit,Credit,Balance,Reference\n2026-01-03,Synthetic,0,10,110,ref\n", encoding="utf-8")
             succeeded = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"), "csv", str(ledger), "inputs/statement.csv", "--mapping", "work/mapping.json", "--account", "work/account.json"], capture_output=True, text=True)
             cleared = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
-            self.assertEqual(2, failed.returncode)
+            self.assertEqual(0, failed.returncode)
             self.assertEqual("blocked", json.loads(blocked.stdout)["state"])
             self.assertEqual(0, succeeded.returncode, succeeded.stderr)
             self.assertNotEqual("blocked", json.loads(cleared.stdout)["state"])

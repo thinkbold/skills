@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult
+from bookkeeper.classification import apply_exact_rules, load_rules
 from bookkeeper.consent import (
     admit_external_result,
     proposal_from_dict,
@@ -37,6 +38,16 @@ from bookkeeper.storage import (
     replace_active_issues,
     sha256_file,
 )
+from bookkeeper.validation import publish_derived_outputs
+
+
+class _UsageError(ValueError):
+    pass
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _UsageError(message)
 
 
 def _read_ledger_json(ledger_root: Path, relative: str) -> dict[str, object]:
@@ -134,7 +145,11 @@ def _record_import(
     else:
         retained = tuple(row for row in existing if row["source_file"] != source_identity)
         merged = merge_import_results((ImportResult(transactions=retained, source_hashes=previous_hashes), result))
-    atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, merged.transactions)
+    classified = apply_exact_rules(merged.transactions, load_rules(ledger_root))
+    ordered = tuple(sorted(classified.transactions, key=lambda row: (
+        row["account_id"], row["currency"], row["transaction_date"], row["posting_date"], row["transaction_id"],
+    )))
+    atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, ordered)
     hashes = {**previous_hashes, **result.source_hashes}
     atomic_write_json(resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json"), {
         "source_hashes": hashes,
@@ -146,6 +161,7 @@ def _record_import(
         {"source_hashes": hashes, "transaction_count": len(merged.transactions), "overlap_count": len(merged.duplicate_sources)},
         dedupe_key=f"{event_type}:{source_hash}",
     )
+    publish_derived_outputs(ledger_root)
     return {"status": "imported", "transaction_count": len(merged.transactions), "audit_event_id": event_id}
 
 
@@ -219,9 +235,11 @@ def _propose_external(ledger_root: Path, proposal_file: str) -> dict[str, object
 
 def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
     _, proposal = _read_proposal(ledger_root, args.proposal)
-    print(json.dumps({"status": "disclosure", "disclosure": proposal_to_dict(proposal)}, sort_keys=True))
     consent_id = record_external_decision(ledger_root, proposal, args.decision == "authorized", args.actor)
-    return {"status": "authorized" if args.decision == "authorized" else "declined", "consent_id": consent_id}
+    return {
+        "consent_id": consent_id, "disclosure": proposal_to_dict(proposal),
+        "status": "authorized" if args.decision == "authorized" else "declined",
+    }
 
 
 def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
@@ -233,7 +251,7 @@ def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, o
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _Parser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     inventory = commands.add_parser("inventory")
     inventory.add_argument("ledger_dir", type=Path)
@@ -312,12 +330,19 @@ def main(argv: list[str] | None = None) -> int:
             output = _external_result(ledger_root, args)
         else:
             output = _correct_row(ledger_root, args)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        print(json.dumps({"status": "blocked", "error": str(error)}))
-        return 2
+    except (OSError, ValueError, json.JSONDecodeError):
+        print(json.dumps({"error": "LEDGER_SCHEMA_INVALID"}, sort_keys=True))
+        return 3
     print(json.dumps(output, sort_keys=True))
-    return 2 if output.get("status") == "blocked" else 0
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except _UsageError:
+        print(json.dumps({"error": "USAGE"}, sort_keys=True))
+        sys.exit(2)
+    except Exception:
+        print(json.dumps({"error": "IMPORT_UNEXPECTED"}, sort_keys=True))
+        sys.exit(4)

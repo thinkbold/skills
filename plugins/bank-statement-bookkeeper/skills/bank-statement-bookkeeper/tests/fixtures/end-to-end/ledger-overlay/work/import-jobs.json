@@ -1,0 +1,6 @@
+[
+  {"account": "work/cad-account.json", "kind": "csv", "mapping": "work/cad-map.json", "phase": "initial", "statement": "inputs/cad-january.csv"},
+  {"account": "work/cad-account.json", "kind": "csv", "mapping": "work/cad-map.json", "phase": "initial", "statement": "inputs/cad-overlap.csv"},
+  {"account": "work/usd-account.json", "kind": "csv", "mapping": "work/usd-map.json", "phase": "initial", "statement": "inputs/usd-january.csv"},
+  {"account": "work/cad-account.json", "kind": "csv", "mapping": "work/cad-map.json", "phase": "later", "statement": "inputs/cad-later.csv"}
+]

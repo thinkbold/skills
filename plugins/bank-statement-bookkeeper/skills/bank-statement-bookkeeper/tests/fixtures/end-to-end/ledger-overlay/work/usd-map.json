@@ -1,0 +1,10 @@
+{
+  "balance": "Balance",
+  "credit": "Credit",
+  "date_formats": ["%Y-%m-%d"],
+  "debit": "Debit",
+  "description": "Description",
+  "posting_date": "Posted",
+  "reference": "Reference",
+  "transaction_date": "Date"
+}

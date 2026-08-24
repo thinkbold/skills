@@ -193,7 +193,7 @@ class PdfLocalTests(unittest.TestCase):
                     "pdf", str(ledger), "inputs/statement.pdf", "--mapping", "work/mapping.json", "--account", "work/account.json",
                 ])
         payload = json.loads(output.getvalue())
-        self.assertEqual(2, returncode)
+        self.assertEqual(0, returncode)
         self.assertEqual(["PDF_LIBRARY_UNAVAILABLE"], payload["issues"])
         self.assertNotIn("OPENAI", output.getvalue())
 

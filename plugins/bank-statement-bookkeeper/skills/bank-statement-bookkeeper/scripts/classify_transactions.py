@@ -26,6 +26,15 @@ from bookkeeper.storage import read_audit_events
 from bookkeeper.storage import replace_active_issues
 
 
+class _UsageError(ValueError):
+    pass
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _UsageError(message)
+
+
 def _json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
@@ -39,7 +48,7 @@ def _current(ledger: Path):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = _Parser()
     commands = parser.add_subparsers(dest="command", required=True)
     pending = commands.add_parser("pending")
     pending.add_argument("ledger")
@@ -109,4 +118,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except _UsageError:
+        _json({"error": "USAGE"})
+        raise SystemExit(2)
+    except ValueError:
+        _json({"error": "LEDGER_SCHEMA_INVALID"})
+        raise SystemExit(3)
+    except Exception:
+        _json({"error": "CLASSIFICATION_UNEXPECTED"})
+        raise SystemExit(4)
