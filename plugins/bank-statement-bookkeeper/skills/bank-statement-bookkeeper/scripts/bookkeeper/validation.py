@@ -9,6 +9,7 @@ import csv
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from typing import Iterable, Mapping
 from datetime import date
@@ -34,6 +35,13 @@ _PENDING_GROUP_FIELDS = ("group_id", "normalized_merchant", "direction", "curren
 _OUTPUT_BUNDLE_JOURNAL = Path("work") / "pending-derived-output.json"
 _OUTPUT_BUNDLE_STAGE = Path("work") / "pending-derived-output-stage"
 _OUTPUT_BUNDLE_BACKUP = Path("work") / "pending-derived-output-backup"
+_OUTPUT_TARGETS = frozenset({
+    "outputs/normalized-transactions.csv", "outputs/classified-transactions.csv",
+    "outputs/account-summary.csv", "outputs/reconciliation.csv",
+    "outputs/reconciliation-report.md", "outputs/exceptions.csv", "outputs/status.json",
+    "work/pending-merchant-groups.csv",
+})
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[Issue, ...]:
@@ -267,51 +275,168 @@ def _money(value: Decimal | None) -> str:
     return "" if value is None else format(value, "f")
 
 
-def recover_pending_output_bundle(ledger_root: Path) -> None:
-    """Finish an interrupted derived-output installation before exposing a new generation."""
-    journal_path = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_JOURNAL)
+def recover_ledger_workflow(ledger_root: Path) -> None:
+    """Preflight every pending protocol before recovering them in dependency order."""
+    from .classification import recover_pending_operation, validate_pending_operation
+    from .importing import recover_pending_correction, validate_pending_correction
+
+    validate_pending_correction(ledger_root)
+    validate_pending_operation(ledger_root)
+    validate_pending_output_bundle(ledger_root)
+    recover_pending_correction(ledger_root)
+    recover_pending_operation(ledger_root)
+    recover_pending_output_bundle(ledger_root)
+
+
+def _lexical_protocol_path(ledger_root: Path, relative: Path, *, directory: bool = False) -> Path:
+    """Return a protocol path only through real ledger/work directories, never symlinks."""
+    root = Path(ledger_root).resolve()
+    for ancestor in (root, root / "work"):
+        try:
+            mode = os.lstat(ancestor).st_mode
+        except FileNotFoundError as error:
+            raise ValueError("derived output protocol root is missing") from error
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ValueError("derived output protocol root is unsafe")
+    candidate = root / relative
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise ValueError("derived output protocol path is unsafe") from error
+    parent = root
+    for part in relative.parts[:-1]:
+        parent = parent / part
+        if parent.exists():
+            mode = os.lstat(parent).st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                raise ValueError("derived output protocol ancestor is unsafe")
+    if candidate.exists() or candidate.is_symlink():
+        mode = os.lstat(candidate).st_mode
+        if stat.S_ISLNK(mode) or (directory and not stat.S_ISDIR(mode)):
+            raise ValueError("derived output protocol path is unsafe")
+    return candidate
+
+
+def _marker_path(ledger_root: Path) -> Path:
+    return _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / ".protocol-marker")
+
+
+def _validate_staged_artifact(relative: str, path: Path, expected: str) -> None:
+    if not path.is_file() or path.is_symlink() or sha256_file(path) != expected:
+        raise ValueError("pending derived output cannot safely recover")
+    if relative.endswith(".csv"):
+        expected_headers = {
+            "outputs/normalized-transactions.csv": CANONICAL_TRANSACTION_FIELDS,
+            "outputs/classified-transactions.csv": CANONICAL_TRANSACTION_FIELDS,
+            "outputs/account-summary.csv": ACCOUNT_SUMMARY_FIELDS,
+            "outputs/reconciliation.csv": RECONCILIATION_FIELDS,
+            "outputs/exceptions.csv": _EXCEPTION_FIELDS,
+            "work/pending-merchant-groups.csv": _PENDING_GROUP_FIELDS,
+        }[relative]
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != expected_headers or any(None in row for row in reader):
+                raise ValueError("pending derived output is malformed")
+    elif relative == "outputs/status.json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("output_hashes"), dict):
+            raise ValueError("pending derived status is malformed")
+    elif not path.read_bytes().endswith(b"\n"):
+        raise ValueError("pending derived report is malformed")
+
+
+def validate_pending_output_bundle(ledger_root: Path) -> None:
+    """Validate an output journal and all staged bytes before any recovery mutation."""
+    journal_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_JOURNAL)
     if not journal_path.exists():
         return
     with journal_path.open("r", encoding="utf-8") as handle:
         journal = json.load(handle)
-    if not isinstance(journal, dict) or set(journal) != {"targets", "version"} or journal["version"] != 1 or not isinstance(journal["targets"], list):
+    if not isinstance(journal, dict) or set(journal) != {"marker", "targets", "version"} or journal["version"] != 2 or not isinstance(journal["marker"], str) or not _SHA256.fullmatch(journal["marker"]) or not isinstance(journal["targets"], list):
         raise ValueError("pending derived output journal is invalid")
-    stage_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE)
-    backup_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_BACKUP)
-    for item in journal["targets"]:
+    stage_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE, directory=True)
+    marker = _marker_path(ledger_root)
+    if not marker.is_file() or marker.is_symlink() or marker.read_text(encoding="ascii") != journal["marker"] + "\n":
+        raise ValueError("pending derived output journal is invalid")
+    targets = journal["targets"]
+    if not targets or len(targets) != len({str(item.get("relative", "")) for item in targets if isinstance(item, dict)}):
+        raise ValueError("pending derived output journal is invalid")
+    ordered = []
+    for item in targets:
         if not isinstance(item, dict) or set(item) != {"relative", "sha256"}:
             raise ValueError("pending derived output journal is invalid")
+        relative, expected = item["relative"], item["sha256"]
+        if not isinstance(relative, str) or relative not in _OUTPUT_TARGETS or not isinstance(expected, str) or not _SHA256.fullmatch(expected):
+            raise ValueError("pending derived output journal is invalid")
+        staged = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
+        _validate_staged_artifact(relative, staged, expected)
+        ordered.append(relative)
+    if ordered[-1] != "outputs/status.json" or "outputs/status.json" not in ordered:
+        raise ValueError("pending derived output journal is invalid")
+
+
+def _remove_protocol_dir(ledger_root: Path, relative: Path, marker: str) -> None:
+    directory = _lexical_protocol_path(ledger_root, relative, directory=True)
+    marker_path = _lexical_protocol_path(ledger_root, relative / ".protocol-marker")
+    if not marker_path.is_file() or marker_path.is_symlink() or marker_path.read_text(encoding="ascii") != marker + "\n":
+        raise ValueError("derived output cleanup is unsafe")
+    for current, dirs, files in os.walk(directory, followlinks=False):
+        if any(Path(current, entry).is_symlink() for entry in (*dirs, *files)):
+            raise ValueError("derived output cleanup is unsafe")
+    shutil.rmtree(directory)
+
+
+def recover_pending_output_bundle(ledger_root: Path) -> None:
+    """Finish an interrupted derived-output installation before exposing a new generation."""
+    journal_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_JOURNAL)
+    if not journal_path.exists():
+        return
+    validate_pending_output_bundle(ledger_root)
+    with journal_path.open("r", encoding="utf-8") as handle:
+        journal = json.load(handle)
+    stage_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE, directory=True)
+    marker = str(journal["marker"])
+    backup_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP, directory=True) if _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP).exists() else None
+    for item in journal["targets"]:
         relative, expected = str(item["relative"]), str(item["sha256"])
-        target = resolve_inside_ledger(ledger_root, relative)
-        staged = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
-        backup = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_BACKUP / relative)
+        target = _lexical_protocol_path(ledger_root, Path(relative))
+        staged = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
+        backup = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP / relative)
         if target.exists() and sha256_file(target) == expected:
             continue
         if not staged.exists() or sha256_file(staged) != expected:
             raise ValueError("pending derived output cannot safely recover")
         target.parent.mkdir(parents=True, exist_ok=True)
+        _lexical_protocol_path(ledger_root, target.relative_to(Path(ledger_root).resolve()).parent, directory=True)
         if target.exists() and not backup.exists():
+            if backup_root is None:
+                backup_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP)
+                backup_root.mkdir()
+                (backup_root / ".protocol-marker").write_text(marker + "\n", encoding="ascii")
             backup.parent.mkdir(parents=True, exist_ok=True)
             os.replace(target, backup)
         os.replace(staged, target)
         if sha256_file(target) != expected:
             raise ValueError("pending derived output installed an unexpected file")
     journal_path.unlink()
-    shutil.rmtree(stage_root, ignore_errors=True)
-    shutil.rmtree(backup_root, ignore_errors=True)
+    _remove_protocol_dir(ledger_root, _OUTPUT_BUNDLE_STAGE, marker)
+    if backup_root is not None:
+        _remove_protocol_dir(ledger_root, _OUTPUT_BUNDLE_BACKUP, marker)
 
 
 def _install_output_bundle(ledger_root: Path, artifacts: Mapping[str, bytes]) -> None:
     recover_pending_output_bundle(ledger_root)
-    stage_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE)
-    backup_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_BACKUP)
-    shutil.rmtree(stage_root, ignore_errors=True)
-    shutil.rmtree(backup_root, ignore_errors=True)
+    stage_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE)
+    backup_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP)
+    if stage_root.exists() or backup_root.exists():
+        raise ValueError("derived output protocol is not clean")
     stage_root.mkdir(parents=True)
+    marker = hashlib.sha256(os.urandom(32)).hexdigest()
+    (stage_root / ".protocol-marker").write_text(marker + "\n", encoding="ascii")
     targets = []
     try:
         for relative, payload in sorted(artifacts.items()):
-            staged = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
+            staged = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
             staged.parent.mkdir(parents=True, exist_ok=True)
             with staged.open("wb") as handle:
                 handle.write(payload)
@@ -330,13 +455,12 @@ def _install_output_bundle(ledger_root: Path, artifacts: Mapping[str, bytes]) ->
             targets.append({"relative": relative, "sha256": sha256_file(staged)})
         # Status is deliberately sorted last: it is the generation commit marker.
         targets.sort(key=lambda item: (item["relative"].endswith("outputs/status.json"), item["relative"]))
-        atomic_write_json(resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_JOURNAL), {"targets": targets, "version": 1})
+        atomic_write_json(_lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_JOURNAL), {"marker": marker, "targets": targets, "version": 2})
         recover_pending_output_bundle(ledger_root)
     except Exception:
         # A journal means recovery must preserve the target generation; without one staging is disposable.
-        if not resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_JOURNAL).exists():
-            shutil.rmtree(stage_root, ignore_errors=True)
-            shutil.rmtree(backup_root, ignore_errors=True)
+        if not _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_JOURNAL).exists():
+            _remove_protocol_dir(ledger_root, _OUTPUT_BUNDLE_STAGE, marker)
         raise
 
 
@@ -350,7 +474,7 @@ def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = Fals
     classified = apply_exact_rules(valid_transactions, load_rules(ledger_root))
     classified_rows = _ordered_transactions(classified.transactions)
     if not canonical_load_issues and not canonical_issues and len(classified_rows) == len(transactions):
-        atomic_write_csv(resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv"), CANONICAL_TRANSACTION_FIELDS, classified_rows)
+        atomic_write_csv(resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv"), CANONICAL_TRANSACTION_FIELDS, classified.transactions)
     from .storage import replace_active_issues
     replace_active_issues(ledger_root, "classification", {"view": "current"}, classified.issues)
     balance_rows, balance_issues = load_balance_rows(ledger_root)

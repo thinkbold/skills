@@ -37,6 +37,14 @@ class EndToEndTests(unittest.TestCase):
             )
             groups = [g for g in pending["groups"] if g["normalized_merchant"] == "OPENAI CHATGPT SUBSCRIPTION"]
             self.assertEqual(1, len(groups))
+            self.assertEqual(["card-usd-002", "checking-cad-001"], groups[0]["account_ids"])
+            self.assertEqual(["CAD", "USD"], groups[0]["currencies"])
+            self.assertEqual([["CAD", "30.00"], ["USD", "30.00"]], groups[0]["totals_by_currency"])
+            self.assertNotIn("total", groups[0])
+            initial_rows = read_classified_rows(ledger)
+            self.assertEqual(4, len(initial_rows))
+            self.assertEqual(1, sum("inputs/cad-january.csv" in row["source_locations"] and "inputs/cad-overlap.csv" in row["source_locations"] for row in initial_rows))
+            self.assertEqual(2, sum(row["reference"] == "AI-REPEAT-01" for row in initial_rows))
             confirmed = self.run_script(
                 "classify_transactions.py", "confirm", str(ledger), groups[0]["group_id"],
                 "--account-code", "6100", "--account-name", "Membership Fee",
@@ -46,6 +54,11 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(0, self.run_script("reconcile_accounts.py", str(ledger)).returncode)
             status = json.loads(self.run_script("validate_ledger.py", str(ledger)).stdout)
             self.assertEqual("complete", status["state"])
+            with (ledger / "outputs" / "reconciliation.csv").open(newline="", encoding="utf-8") as handle:
+                reconciliations = list(csv.DictReader(handle))
+            self.assertEqual(3, len(reconciliations))
+            cad_current = next(row for row in reconciliations if row["currency"] == "CAD" and row["period_start"] == "2026-01-01")
+            self.assertEqual("prior_year_end_statement", cad_current["opening_source_type"])
             self._assert_output_bundle(ledger, status)
             first_hashes = _bundle_hashes(ledger)
             first_audit = (ledger / "audit" / "audit.jsonl").read_bytes()

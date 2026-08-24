@@ -24,6 +24,8 @@ from bookkeeper.classification import (
 )
 from bookkeeper.storage import read_audit_events
 from bookkeeper.storage import replace_active_issues
+from bookkeeper.ledger import load_ledger
+from bookkeeper.validation import publish_derived_outputs, recover_ledger_workflow
 
 
 class _UsageError(ValueError):
@@ -81,11 +83,12 @@ def main() -> int:
     deleted.add_argument("--actor", required=True)
     args = parser.parse_args()
     ledger = Path(args.ledger)
-    recover_pending_operation(ledger)
+    load_ledger(ledger)
+    recover_ledger_workflow(ledger)
     if args.command == "pending":
         current = _current(ledger)
         groups = build_pending_groups(current.transactions)
-        _json({"group_count": len(groups), "groups": [asdict(group) for group in groups], "issue_count": len(current.issues)})
+        output = {"group_count": len(groups), "groups": [asdict(group) for group in groups], "issue_count": len(current.issues)}
     elif args.command == "confirm":
         current = _current(ledger)
         group = next((item for item in build_pending_groups(current.transactions) if item.group_id == args.group_id), None)
@@ -98,22 +101,24 @@ def main() -> int:
         else:
             result = confirm_group(ledger, current.transactions, group.normalized_merchant, group.direction, args.account_code, args.account_name, args.apply_future, args.actor, group.transaction_ids)
         save_transactions(ledger, result.transactions)
-        _json({"classified_count": sum(row["classification_status"] == "classified" for row in result.transactions), "created_rule_ids": [rule["rule_id"] for rule in result.created_rules], "audit_event_ids": list(result.audit_event_ids)})
+        output = {"classified_count": sum(row["classification_status"] == "classified" for row in result.transactions), "created_rule_ids": [rule["rule_id"] for rule in result.created_rules], "audit_event_ids": list(result.audit_event_ids)}
     elif args.command == "correct":
         current = _current(ledger)
         result = correct_transactions(ledger, current.transactions, tuple(args.transaction_id), args.account_code, args.account_name, args.scope, args.actor)
         save_transactions(ledger, result.transactions)
-        _json({"corrected_count": len(args.transaction_id), "created_rule_ids": [rule["rule_id"] for rule in result.created_rules], "audit_event_ids": list(result.audit_event_ids)})
+        output = {"corrected_count": len(args.transaction_id), "created_rule_ids": [rule["rule_id"] for rule in result.created_rules], "audit_event_ids": list(result.audit_event_ids)}
     elif args.command == "rules":
         records = load_rules(ledger)
-        _json({"rule_count": len(records), "rules": records})
+        output = {"rule_count": len(records), "rules": records}
     elif args.command == "export-rules":
         output = export_rules(ledger, args.destination)
-        _json({"exported_rule_count": len(load_rules(ledger)), "destination": str(output)})
+        output = {"exported_rule_count": len(load_rules(ledger)), "destination": str(output)}
     elif args.command == "deactivate-rule":
-        _json({"rule_id": args.rule_id, "audit_event_id": deactivate_rule(ledger, args.rule_id, args.actor)})
+        output = {"rule_id": args.rule_id, "audit_event_id": deactivate_rule(ledger, args.rule_id, args.actor)}
     else:
-        _json({"rule_id": args.rule_id, "audit_event_id": delete_rule(ledger, args.rule_id, args.actor)})
+        output = {"rule_id": args.rule_id, "audit_event_id": delete_rule(ledger, args.rule_id, args.actor)}
+    publish_derived_outputs(ledger)
+    _json(output)
     return 0
 
 

@@ -309,6 +309,7 @@ def _correction_timestamp() -> str:
 _CANONICAL_RELATIVE_PATH = Path("work") / "normalized-transactions.csv"
 _PENDING_CORRECTION_RELATIVE_PATH = Path("work") / "pending-correction.json"
 _STAGED_CORRECTION_RELATIVE_PATH = Path("work") / "pending-correction.csv"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _append_correction(ledger_root: Path, event: dict[str, str]) -> None:
@@ -408,6 +409,7 @@ def stage_manual_correction(
             "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
             "transaction_id": transaction_id,
         },
+        "base_canonical_sha256": sha256_file(resolve_inside_ledger(ledger_root, _CANONICAL_RELATIVE_PATH)),
         "canonical_relative_path": str(_CANONICAL_RELATIVE_PATH),
         "correction_record": correction_record,
         "event_id": event_id,
@@ -418,26 +420,47 @@ def stage_manual_correction(
     return output
 
 
-def recover_pending_correction(ledger_root: Path) -> None:
-    """Finish a journaled correction exactly once after a process interruption."""
+def validate_pending_correction(ledger_root: Path) -> None:
+    """Validate correction staging and its unchanged base before any recovery mutation."""
     journal_path = resolve_inside_ledger(ledger_root, _PENDING_CORRECTION_RELATIVE_PATH)
     if not journal_path.exists():
         return
     with journal_path.open("r", encoding="utf-8") as handle:
         journal = json.load(handle)
-    if not isinstance(journal, dict):
-        raise ValueError("pending correction journal is invalid")
     required = {
-        "audit_payload", "canonical_relative_path", "correction_record", "event_id",
+        "audit_payload", "base_canonical_sha256", "canonical_relative_path", "correction_record", "event_id",
         "expected_canonical_sha256", "staged_relative_path",
     }
-    if set(journal) != required or not isinstance(journal["audit_payload"], dict) or not isinstance(journal["correction_record"], dict):
+    if set(journal) != required or not isinstance(journal.get("audit_payload"), dict) or not isinstance(journal.get("correction_record"), dict):
         raise ValueError("pending correction journal is invalid")
+    if not all(isinstance(journal[key], str) and _SHA256.fullmatch(journal[key]) for key in ("base_canonical_sha256", "expected_canonical_sha256")):
+        raise ValueError("pending correction journal is invalid")
+    if journal["canonical_relative_path"] != str(_CANONICAL_RELATIVE_PATH) or journal["staged_relative_path"] != str(_STAGED_CORRECTION_RELATIVE_PATH):
+        raise ValueError("pending correction journal is invalid")
+    staged = resolve_inside_ledger(ledger_root, _STAGED_CORRECTION_RELATIVE_PATH)
+    if not staged.is_file() or sha256_file(staged) != journal["expected_canonical_sha256"]:
+        raise ValueError("pending correction journal is invalid")
+    current = resolve_inside_ledger(ledger_root, _CANONICAL_RELATIVE_PATH)
+    current_hash = sha256_file(current) if current.exists() else ""
+    if current_hash not in {journal["base_canonical_sha256"], journal["expected_canonical_sha256"]}:
+        raise ValueError("pending correction conflicts with current ledger state")
+
+
+def recover_pending_correction(ledger_root: Path) -> None:
+    """Finish a journaled correction exactly once after a process interruption."""
+    journal_path = resolve_inside_ledger(ledger_root, _PENDING_CORRECTION_RELATIVE_PATH)
+    if not journal_path.exists():
+        return
+    validate_pending_correction(ledger_root)
+    with journal_path.open("r", encoding="utf-8") as handle:
+        journal = json.load(handle)
     canonical_path = resolve_inside_ledger(ledger_root, str(journal["canonical_relative_path"]))
     staged_path = resolve_inside_ledger(ledger_root, str(journal["staged_relative_path"]))
     expected_hash = str(journal["expected_canonical_sha256"])
     canonical_matches = canonical_path.exists() and sha256_file(canonical_path) == expected_hash
     if not canonical_matches:
+        if not canonical_path.exists() or sha256_file(canonical_path) != journal["base_canonical_sha256"]:
+            raise ValueError("pending correction conflicts with current ledger state")
         if not staged_path.exists() or sha256_file(staged_path) != expected_hash:
             raise ValueError("pending correction cannot safely recover canonical rows")
         os.replace(staged_path, canonical_path)

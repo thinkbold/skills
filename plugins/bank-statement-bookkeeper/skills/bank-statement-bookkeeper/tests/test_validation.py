@@ -260,6 +260,32 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(0, succeeded.returncode, succeeded.stderr)
             self.assertNotEqual("blocked", json.loads(cleared.stdout)["state"])
 
+    def test_derived_stage_symlink_is_rejected_without_deleting_outputs(self) -> None:
+        """Catches recovery cleaning a resolved symlink target outside its freshly-made protocol directory."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            status = ledger / "outputs" / "status.json"
+            status.write_text('{"sentinel":true}\n', encoding="utf-8")
+            (ledger / "work" / "pending-derived-output-stage").symlink_to(ledger / "outputs", target_is_directory=True)
+            (ledger / "work" / "pending-derived-output.json").write_text(json.dumps({
+                "marker": "0" * 64, "targets": [], "version": 2,
+            }), encoding="utf-8")
+            result = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
+            self.assertEqual(3, result.returncode)
+            self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(result.stdout)["error"])
+            self.assertEqual('{"sentinel":true}\n', status.read_text(encoding="utf-8"))
+
+    def test_classify_empty_directory_does_not_create_ledger_files(self) -> None:
+        """Catches classification recovery or views creating work files before ledger validation."""
+        with TemporaryDirectory() as temp:
+            empty = Path(temp) / "empty"
+            empty.mkdir()
+            result = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "classify_transactions.py"), "pending", str(empty)], capture_output=True, text=True)
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+            self.assertEqual([], list(empty.iterdir()))
+
 
 if __name__ == "__main__":
     unittest.main()
