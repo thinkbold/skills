@@ -49,7 +49,7 @@ python <skill>/scripts/classify_transactions.py pending <ledger>
 
 Ask once per `normalized_merchant` + `direction` group. The question contains up to three sample descriptions, transaction count, date range, account IDs, and amounts separated by currency. Never add a grand total or convert currencies. Ask for the category and whether it applies only to selected rows or also to a future exact rule.
 
-When `<ledger>/chart-of-accounts.csv` exists, require an active existing `account_code`; do not create or propose a new code. Without a chart, require a nonempty free-form `account_name` and pass a blank `account_code`.
+When `<ledger>/chart-of-accounts.csv` exists, require an active existing `account_code` and its exact chart `account_name`; do not create or propose a new code or alias. Without a chart, require a nonempty free-form `account_name` and pass a blank `account_code`.
 
 ```sh
 python <skill>/scripts/classify_transactions.py confirm <ledger> <group-id> --account-code 6100 --account-name "Membership Fee" [--apply-future] --actor user
@@ -57,13 +57,15 @@ python <skill>/scripts/classify_transactions.py correct <ledger> --transaction-i
 python <skill>/scripts/classify_transactions.py correct <ledger> --transaction-id <id> --account-code 6100 --account-name "Membership Fee" --scope future_rule --actor user
 ```
 
-An active `exact_normalized` rule may auto-classify only the same normalized merchant/direction and applicable account scope in this ledger. Fuzzy matches remain suggestions and need confirmation. `selected` preserves future behavior; `future_rule` replaces one matching active rule. Inspect or manage current ledger rules with `rules`, `export-rules`, `deactivate-rule`, and `delete-rule`; run each subcommand with `--help` before use.
+An active, audit-authorized `exact_normalized` rule may auto-classify only the same normalized merchant/direction and applicable account scope in this ledger. Fuzzy matches remain suggestions and need confirmation. `selected` preserves future behavior; `future_rule` replaces one matching active rule. Inspect or manage current ledger rules with `rules`, `export-rules`, `deactivate-rule`, and `delete-rule`; run each subcommand with `--help` before use. Export only to a non-reserved `.csv` path under the ledger's real `outputs/` directory, for example `outputs/merchant-rules-export.csv`.
 
 If `outputs/status.json` reports more pending transactions than the summed `transaction_count` in `work/pending-merchant-groups.csv`, some valid unclassified rows could not form a merchant group. Find only those unclassified transaction IDs in `outputs/classified-transactions.csv`. Ask with the same samples/count/dates/accounts/per-currency format. Then either (a) use `import_statements.py correct-row --field normalized_merchant` with user-verified merchant evidence and rerun `pending`, or (b) classify the explicit IDs with `classify_transactions.py correct --scope selected`. Do not create a future rule from an empty/ambiguous merchant.
 
+`correct-row` is only for extracted dates, amounts/balance, reference, and the verified normalized merchant of an unclassified row. It cannot set classification status, account code/name, or rule ID; use the classification commands for every category decision.
+
 ## 6. Supply balance evidence and reconcile
 
-For every account + currency + period, populate `inputs/account-balances.csv`. Obtain either a user-confirmed opening balance with source provenance or verifiable prior-year-end evidence. `prior_year_end_statement` is accepted only from a distinct, confirmed, reconciled predecessor for the same account/currency ending one day before the current period, with a matching closing/opening amount.
+For every account + currency + period, populate `inputs/account-balances.csv`. Use only `user_provided`, `statement_opening`, or `prior_year_end_statement` as `opening_source_type`; any other label is blocking. Obtain either a user-confirmed opening balance with source provenance or verifiable prior-year-end evidence. `prior_year_end_statement` is accepted only from a distinct, confirmed, reconciled predecessor for the same account/currency ending one day before the current period, with a matching closing/opening amount.
 
 ```sh
 python <skill>/scripts/reconcile_accounts.py <ledger>

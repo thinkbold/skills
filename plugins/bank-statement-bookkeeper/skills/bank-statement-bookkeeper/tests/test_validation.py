@@ -22,7 +22,7 @@ from bookkeeper.classification import save_transactions
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, BALANCE_FIELDS
 from bookkeeper.storage import atomic_write_csv, replace_active_issues
 from bookkeeper.reconciliation import reconcile_account_period
-from bookkeeper.validation import _masked_message, collect_ledger_issues, determine_run_state, finalize_outputs, publish_derived_outputs
+from bookkeeper.validation import _masked_message, collect_ledger_issues, determine_run_state, finalize_outputs, publish_derived_outputs, recover_pending_output_bundle
 
 
 _DERIVED_TARGETS = (
@@ -44,6 +44,14 @@ _GENERATION_INPUTS = (
     "work/import-manifest.json",
     "audit/audit.jsonl",
 )
+
+
+def _owned_protocol_marker(token: str) -> str:
+    return json.dumps({
+        "owner": "bank-statement-bookkeeper",
+        "protocol": "derived-output-v3",
+        "token": token,
+    }, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def _valid_transaction(
@@ -105,7 +113,7 @@ def _stage_current_generation(ledger: Path, mutate: Callable[[Path], None]) -> N
     stage = ledger / "work" / "pending-derived-output-stage"
     stage.mkdir()
     marker = "a" * 64
-    (stage / ".protocol-marker").write_text(marker + "\n", encoding="ascii")
+    (stage / ".protocol-marker").write_text(_owned_protocol_marker(marker), encoding="ascii")
     for relative in _DERIVED_TARGETS:
         target = stage / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -527,6 +535,88 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("CANONICAL_STATUS_INVALID", {issue.code for issue in validate_canonical_transactions((complete,))})
         self.assertIn("CANONICAL_SCHEMA_INVALID", {issue.code for issue in validate_canonical_transactions((malformed,))})
 
+    def test_final_cli_blocks_classified_rows_outside_the_ledger_chart_contract(self) -> None:
+        """Catches hand-edited category fields reaching complete without the ledger's exact chart pair."""
+        cases = (
+            (True, "6100", "Software"),
+            (True, "9999", "Membership Fee"),
+            (False, "6100", "Membership Fee"),
+        )
+        for has_chart, account_code, account_name in cases:
+            with self.subTest(has_chart=has_chart, account_code=account_code), TemporaryDirectory() as temp:
+                ledger = Path(temp) / "ledger"
+                initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+                if has_chart:
+                    atomic_write_csv(
+                        ledger / "chart-of-accounts.csv",
+                        ("account_code", "account_name", "active"),
+                        ({"account_code": "6100", "account_name": "Membership Fee", "active": "true"},),
+                    )
+                transaction = _valid_transaction()
+                transaction.update({
+                    "classification_status": "classified",
+                    "account_code": account_code,
+                    "account_name": account_name,
+                })
+                canonical = ledger / "work" / "normalized-transactions.csv"
+                atomic_write_csv(canonical, CANONICAL_TRANSACTION_FIELDS, (transaction,))
+                atomic_write_csv(
+                    ledger / "inputs" / "account-balances.csv", BALANCE_FIELDS,
+                    (_valid_balance(),),
+                )
+                canonical_before = canonical.read_bytes()
+
+                result = subprocess.run(
+                    [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                    capture_output=True, text=True,
+                )
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("blocked", json.loads(result.stdout)["state"])
+                self.assertNotEqual("complete", json.loads(result.stdout)["state"])
+                self.assertIn(
+                    "CHART_REFERENCE_INVALID",
+                    {row["code"] for row in _read_csv(ledger / "outputs" / "exceptions.csv")},
+                )
+                self.assertEqual(canonical_before, canonical.read_bytes())
+
+    def test_final_cli_treats_a_header_only_chart_as_authoritative(self) -> None:
+        """Catches a supplied empty chart being treated like no chart during final validation."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            atomic_write_csv(
+                ledger / "chart-of-accounts.csv",
+                ("account_code", "account_name", "active"),
+                (),
+            )
+            transaction = _valid_transaction()
+            transaction.update({
+                "classification_status": "classified",
+                "account_code": "",
+                "account_name": "Free-form category",
+            })
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            atomic_write_csv(canonical, CANONICAL_TRANSACTION_FIELDS, (transaction,))
+            atomic_write_csv(
+                ledger / "inputs" / "account-balances.csv", BALANCE_FIELDS,
+                (_valid_balance(),),
+            )
+            canonical_before = canonical.read_bytes()
+
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True, text=True,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("blocked", json.loads(result.stdout)["state"])
+            self.assertIn(
+                "CHART_REFERENCE_INVALID",
+                {row["code"] for row in _read_csv(ledger / "outputs" / "exceptions.csv")},
+            )
+            self.assertEqual(canonical_before, canonical.read_bytes())
+
     def test_final_cli_blocks_bogus_status_and_nan_without_unexpected_error(self) -> None:
         """Catches exact-rule Decimal parsing occurring before canonical validation."""
         with TemporaryDirectory() as temp:
@@ -648,6 +738,263 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(3, result.returncode)
             self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(result.stdout)["error"])
             self.assertEqual('{"sentinel":true}\n', status.read_text(encoding="utf-8"))
+
+    def test_orphaned_managed_stage_without_a_journal_is_cleaned_before_next_publish(self) -> None:
+        """Catches a crash before journal creation permanently wedging derived-output publication."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            stage = ledger / "work" / "pending-derived-output-stage"
+            stage.mkdir()
+            (stage / ".protocol-marker").write_text(
+                _owned_protocol_marker("a" * 64), encoding="ascii",
+            )
+            staged_output = stage / "outputs" / "exceptions.csv"
+            staged_output.parent.mkdir()
+            staged_output.write_text("partial staged bytes\n", encoding="utf-8")
+
+            status = publish_derived_outputs(ledger)
+
+            self.assertEqual("reconciliation_pending", status["state"])
+            self.assertTrue((ledger / "outputs" / "status.json").is_file())
+            self.assertFalse(stage.exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output-backup").exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output.json").exists())
+
+    def test_recovery_cleans_an_empty_unmarked_stage_without_modifying_ledger_files(self) -> None:
+        """Catches a crash between stage mkdir and marker write permanently wedging recovery."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            stage = ledger / "work" / "pending-derived-output-stage"
+            stage.mkdir()
+            before = {
+                path.relative_to(ledger).as_posix(): path.read_bytes()
+                for path in ledger.rglob("*") if path.is_file()
+            }
+
+            recover_pending_output_bundle(ledger)
+
+            after = {
+                path.relative_to(ledger).as_posix(): path.read_bytes()
+                for path in ledger.rglob("*") if path.is_file()
+            }
+            self.assertFalse(stage.exists())
+            self.assertEqual(before, after)
+            status = publish_derived_outputs(ledger)
+            self.assertEqual("reconciliation_pending", status["state"])
+            self.assertFalse((ledger / "work" / "pending-derived-output.json").exists())
+
+    def test_publish_cleans_a_stage_with_only_an_interrupted_marker_prefix(self) -> None:
+        """Catches a crash during the first stage marker write permanently wedging publication."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            stage = ledger / "work" / "pending-derived-output-stage"
+            stage.mkdir()
+            canonical = _owned_protocol_marker("d" * 64)
+            (stage / ".protocol-marker").write_bytes(canonical[:73].encode("ascii"))
+            sentinel = ledger / "inputs" / "user-sentinel.txt"
+            sentinel.write_text("must remain unchanged\n", encoding="utf-8")
+
+            status = publish_derived_outputs(ledger)
+
+            self.assertEqual("reconciliation_pending", status["state"])
+            self.assertFalse(stage.exists())
+            self.assertEqual("must remain unchanged\n", sentinel.read_text(encoding="utf-8"))
+
+    def test_publish_cleans_an_empty_unmarked_backup_and_converges(self) -> None:
+        """Catches a crash between backup mkdir and marker write permanently wedging publication."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            backup = ledger / "work" / "pending-derived-output-backup"
+            backup.mkdir()
+            sentinel = ledger / "inputs" / "user-sentinel.txt"
+            sentinel.write_text("must remain unchanged\n", encoding="utf-8")
+
+            status = publish_derived_outputs(ledger)
+
+            self.assertEqual("reconciliation_pending", status["state"])
+            self.assertFalse(backup.exists())
+            self.assertEqual("must remain unchanged\n", sentinel.read_text(encoding="utf-8"))
+            self.assertFalse((ledger / "work" / "pending-derived-output.json").exists())
+
+    def test_journal_recovery_removes_an_empty_unmarked_backup_before_resuming(self) -> None:
+        """Catches the backup mkdir-to-marker crash window wedging a journal-backed recovery."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            publish_derived_outputs(ledger)
+            before_outputs = {
+                relative: (ledger / relative).read_bytes()
+                for relative in _DERIVED_TARGETS
+            }
+            _stage_current_generation(ledger, lambda _stage: None)
+            backup = ledger / "work" / "pending-derived-output-backup"
+            backup.mkdir()
+
+            recover_pending_output_bundle(ledger)
+
+            after_outputs = {
+                relative: (ledger / relative).read_bytes()
+                for relative in _DERIVED_TARGETS
+            }
+            self.assertEqual(before_outputs, after_outputs)
+            self.assertFalse(backup.exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output-stage").exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output.json").exists())
+
+    def test_journal_recovery_removes_a_backup_with_only_its_interrupted_marker_prefix(self) -> None:
+        """Catches a partial current-marker write wedging journal-backed backup recovery."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            publish_derived_outputs(ledger)
+            before_outputs = {
+                relative: (ledger / relative).read_bytes()
+                for relative in _DERIVED_TARGETS
+            }
+            _stage_current_generation(ledger, lambda _stage: None)
+            backup = ledger / "work" / "pending-derived-output-backup"
+            backup.mkdir()
+            current_marker = _owned_protocol_marker("a" * 64)
+            (backup / ".protocol-marker").write_bytes(current_marker[:82].encode("ascii"))
+
+            recover_pending_output_bundle(ledger)
+
+            self.assertEqual(before_outputs, {
+                relative: (ledger / relative).read_bytes()
+                for relative in _DERIVED_TARGETS
+            })
+            self.assertFalse(backup.exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output-stage").exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output.json").exists())
+
+    def test_journal_recovery_rejects_a_different_truncated_backup_marker_without_mutation(self) -> None:
+        """Catches treating another operation's marker prefix as the current journal's crash residue."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            publish_derived_outputs(ledger)
+            _stage_current_generation(ledger, lambda _stage: None)
+            backup = ledger / "work" / "pending-derived-output-backup"
+            backup.mkdir()
+            different_marker = _owned_protocol_marker("b" * 64)
+            (backup / ".protocol-marker").write_bytes(different_marker[:82].encode("ascii"))
+            before = {
+                path.relative_to(ledger).as_posix(): path.read_bytes()
+                for path in ledger.rglob("*") if path.is_file()
+            }
+
+            with self.assertRaises(ValueError):
+                recover_pending_output_bundle(ledger)
+
+            self.assertEqual(before, {
+                path.relative_to(ledger).as_posix(): path.read_bytes()
+                for path in ledger.rglob("*") if path.is_file()
+            })
+
+    def test_journal_recovery_refuses_a_nonempty_unmarked_backup_without_mutation(self) -> None:
+        """Catches journal recovery mutating targets before rejecting an unowned backup directory."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            publish_derived_outputs(ledger)
+            _stage_current_generation(ledger, lambda _stage: None)
+            backup = ledger / "work" / "pending-derived-output-backup"
+            backup.mkdir()
+            (backup / "user-data.txt").write_text("must survive\n", encoding="utf-8")
+            before = {
+                path.relative_to(ledger).as_posix(): path.read_bytes()
+                for path in ledger.rglob("*") if path.is_file()
+            }
+
+            with self.assertRaises(ValueError):
+                recover_pending_output_bundle(ledger)
+
+            after = {
+                path.relative_to(ledger).as_posix(): path.read_bytes()
+                for path in ledger.rglob("*") if path.is_file()
+            }
+            self.assertEqual(before, after)
+            self.assertEqual("must survive\n", (backup / "user-data.txt").read_text(encoding="utf-8"))
+
+    def test_orphaned_managed_stage_and_backup_after_journal_deletion_are_cleaned(self) -> None:
+        """Catches a crash after journal deletion leaving a permanent stage/backup publication wedge."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            publish_derived_outputs(ledger)
+            marker = _owned_protocol_marker("b" * 64)
+            stage = ledger / "work" / "pending-derived-output-stage"
+            backup = ledger / "work" / "pending-derived-output-backup"
+            stage.mkdir()
+            backup.mkdir()
+            (stage / ".protocol-marker").write_text(marker, encoding="ascii")
+            (backup / ".protocol-marker").write_text(marker, encoding="ascii")
+            (stage / "outputs").mkdir()
+            backup_status = backup / "outputs" / "status.json"
+            backup_status.parent.mkdir()
+            shutil.copy2(ledger / "outputs" / "status.json", backup_status)
+
+            status = publish_derived_outputs(ledger)
+
+            self.assertEqual("reconciliation_pending", status["state"])
+            self.assertFalse(stage.exists())
+            self.assertFalse(backup.exists())
+            self.assertFalse((ledger / "work" / "pending-derived-output.json").exists())
+            self.assertEqual(status, json.loads((ledger / "outputs" / "status.json").read_text(encoding="utf-8")))
+
+    def test_orphan_cleanup_refuses_missing_foreign_hostile_and_symlinked_directories(self) -> None:
+        """Catches orphan cleanup deleting a directory not proven to be a safe plugin artifact."""
+        for case in (
+            "missing-stage-marker", "missing-backup-marker", "foreign-marker",
+            "hostile-content", "symlink-content",
+        ):
+            with self.subTest(case=case), TemporaryDirectory() as temp:
+                ledger = Path(temp) / "ledger"
+                initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+                orphan = ledger / "work" / (
+                    "pending-derived-output-backup"
+                    if case == "missing-backup-marker"
+                    else "pending-derived-output-stage"
+                )
+                orphan.mkdir()
+                outside = Path(temp) / "outside.txt"
+                outside.write_text("outside-sentinel\n", encoding="utf-8")
+                if case not in {"missing-stage-marker", "missing-backup-marker"}:
+                    marker = (
+                        "foreign-plugin-marker\n"
+                        if case == "foreign-marker"
+                        else _owned_protocol_marker("c" * 64)
+                    )
+                    (orphan / ".protocol-marker").write_text(marker, encoding="ascii")
+                if case == "hostile-content":
+                    (orphan / "user-data.txt").write_text("must survive\n", encoding="utf-8")
+                elif case in {"missing-stage-marker", "missing-backup-marker"}:
+                    (orphan / "unmarked-user-data.txt").write_text("must survive\n", encoding="utf-8")
+                elif case == "symlink-content":
+                    (orphan / "outputs").mkdir()
+                    (orphan / "outputs" / "status.json").symlink_to(outside)
+
+                before = {
+                    path.relative_to(orphan).as_posix(): (
+                        "symlink" if path.is_symlink() else path.read_bytes()
+                    )
+                    for path in orphan.rglob("*") if not path.is_dir()
+                }
+                with self.assertRaises(ValueError):
+                    publish_derived_outputs(ledger)
+                after = {
+                    path.relative_to(orphan).as_posix(): (
+                        "symlink" if path.is_symlink() else path.read_bytes()
+                    )
+                    for path in orphan.rglob("*") if not path.is_dir()
+                }
+                self.assertTrue(orphan.exists())
+                self.assertEqual(before, after)
+                self.assertEqual("outside-sentinel\n", outside.read_text(encoding="utf-8"))
 
     def test_classify_empty_directory_does_not_create_ledger_files(self) -> None:
         """Catches classification recovery or views creating work files before ledger validation."""

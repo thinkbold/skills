@@ -36,6 +36,8 @@ _PENDING_GROUP_FIELDS = ("group_id", "normalized_merchant", "direction", "curren
 _OUTPUT_BUNDLE_JOURNAL = Path("work") / "pending-derived-output.json"
 _OUTPUT_BUNDLE_STAGE = Path("work") / "pending-derived-output-stage"
 _OUTPUT_BUNDLE_BACKUP = Path("work") / "pending-derived-output-backup"
+_OUTPUT_PROTOCOL_OWNER = "bank-statement-bookkeeper"
+_OUTPUT_PROTOCOL_NAME = "derived-output-v3"
 _OUTPUT_TARGETS = frozenset({
     "outputs/normalized-transactions.csv", "outputs/classified-transactions.csv",
     "outputs/account-summary.csv", "outputs/reconciliation.csv",
@@ -52,12 +54,28 @@ _GENERATION_INPUTS = (
     "inputs/account-balances.csv", "ledger.json", "work/import-manifest.json", "audit/audit.jsonl",
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_OUTPUT_PROTOCOL_DIRECTORIES = frozenset(
+    Path(relative).parent.as_posix() for relative in _OUTPUT_TARGETS
+)
 
 
-def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[Issue, ...]:
+def validate_canonical_transactions(
+    transactions: Iterable[Mapping[str, object]],
+    chart: Iterable[object] | None = None,
+    *,
+    chart_present: bool | None = None,
+) -> tuple[Issue, ...]:
     """Block malformed canonical rows before grouping or reconciliation can omit them."""
     issues: list[Issue] = []
     rows = tuple(transactions)
+    chart_entries = None if chart is None else tuple(chart)
+    enforce_chart_contract = chart_present is not None or chart_entries is not None
+    supplied_chart = chart_entries is not None if chart_present is None else chart_present
+    active_categories = {
+        str(getattr(entry, "account_code")): str(getattr(entry, "account_name"))
+        for entry in chart_entries or ()
+        if bool(getattr(entry, "active"))
+    }
     identifiers = [str(row.get("transaction_id") or "").strip() for row in rows]
     duplicates = {value for value in identifiers if value and identifiers.count(value) > 1}
     for index, row in enumerate(rows, start=1):
@@ -77,6 +95,21 @@ def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]
         status = str(row.get("classification_status") or "")
         if status not in {"unclassified", "classified"} or (status == "classified" and not str(row.get("account_name") or "").strip()):
             issues.append(Issue("CANONICAL_STATUS_INVALID", "Canonical transaction classification is invalid.", True, source_location=str(index)))
+        if status == "classified" and enforce_chart_contract:
+            code = str(row.get("account_code") or "").strip()
+            name = str(row.get("account_name") or "").strip()
+            valid_category = (
+                active_categories.get(code) == name
+                if supplied_chart
+                else not code and bool(name)
+            )
+            if not valid_category:
+                issues.append(Issue(
+                    "CHART_REFERENCE_INVALID",
+                    "Canonical classification does not match the ledger chart contract.",
+                    True,
+                    source_location=str(index),
+                ))
         try:
             date.fromisoformat(str(row.get("transaction_date") or "")); date.fromisoformat(str(row.get("posting_date") or ""))
         except ValueError:
@@ -90,12 +123,26 @@ def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]
     return tuple(issues)
 
 
-def admit_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[tuple[dict[str, str], ...], tuple[Issue, ...]]:
+def admit_canonical_transactions(
+    transactions: Iterable[Mapping[str, object]],
+    chart: Iterable[object] | None = None,
+    *,
+    chart_present: bool | None = None,
+) -> tuple[tuple[dict[str, str], ...], tuple[Issue, ...]]:
     """Return only rows valid both locally and as part of this canonical batch."""
     rows = tuple(transactions)
-    batch_issues = validate_canonical_transactions(rows)
+    chart_entries = None if chart is None else tuple(chart)
+    batch_issues = validate_canonical_transactions(
+        rows, chart_entries, chart_present=chart_present,
+    )
     duplicate_ids = {str(row.get("transaction_id") or "").strip() for row in rows if str(row.get("transaction_id") or "").strip() and sum(str(item.get("transaction_id") or "").strip() == str(row.get("transaction_id") or "").strip() for item in rows) > 1}
-    admitted = tuple(row for row in rows if str(row.get("transaction_id") or "").strip() not in duplicate_ids and not validate_canonical_transactions((row,)))
+    admitted = tuple(
+        row for row in rows
+        if str(row.get("transaction_id") or "").strip() not in duplicate_ids
+        and not validate_canonical_transactions(
+            (row,), chart_entries, chart_present=chart_present,
+        )
+    )
     return admitted, batch_issues
 
 
@@ -392,8 +439,124 @@ def _authoritative_generation(ledger_root: Path) -> dict[str, str]:
     return generation
 
 
-def _marker_path(ledger_root: Path) -> Path:
-    return _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / ".protocol-marker")
+def _protocol_marker_text(marker: str) -> str:
+    return json.dumps({
+        "owner": _OUTPUT_PROTOCOL_OWNER,
+        "protocol": _OUTPUT_PROTOCOL_NAME,
+        "token": marker,
+    }, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def _read_protocol_marker(
+    ledger_root: Path,
+    relative: Path,
+    expected: str | None = None,
+) -> str:
+    marker_path = _lexical_protocol_path(ledger_root, relative / ".protocol-marker")
+    if not marker_path.is_file() or marker_path.is_symlink():
+        raise ValueError("derived output protocol marker is invalid")
+    try:
+        payload = json.loads(marker_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("derived output protocol marker is invalid") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"owner", "protocol", "token"}
+        or payload.get("owner") != _OUTPUT_PROTOCOL_OWNER
+        or payload.get("protocol") != _OUTPUT_PROTOCOL_NAME
+        or not isinstance(payload.get("token"), str)
+        or not _SHA256.fullmatch(payload["token"])
+        or (expected is not None and payload["token"] != expected)
+    ):
+        raise ValueError("derived output protocol marker is invalid")
+    return str(payload["token"])
+
+
+def _validate_protocol_directory(
+    ledger_root: Path,
+    relative: Path,
+    expected_marker: str | None = None,
+) -> str:
+    """Prove an exact protocol directory contains only plugin-managed paths."""
+    directory = _lexical_protocol_path(ledger_root, relative, directory=True)
+    marker = _read_protocol_marker(ledger_root, relative, expected_marker)
+    try:
+        for current, dirs, files in os.walk(directory, followlinks=False):
+            current_path = Path(current)
+            for entry in dirs:
+                path = current_path / entry
+                mode = os.lstat(path).st_mode
+                nested = path.relative_to(directory).as_posix()
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or nested not in _OUTPUT_PROTOCOL_DIRECTORIES:
+                    raise ValueError("derived output protocol directory is unsafe")
+            for entry in files:
+                path = current_path / entry
+                mode = os.lstat(path).st_mode
+                nested = path.relative_to(directory).as_posix()
+                if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                    raise ValueError("derived output protocol directory is unsafe")
+                if nested != ".protocol-marker" and nested not in _OUTPUT_TARGETS:
+                    raise ValueError("derived output protocol directory is unsafe")
+    except OSError as error:
+        raise ValueError("derived output protocol directory is unsafe") from error
+    return marker
+
+
+def _is_interrupted_protocol_directory(
+    ledger_root: Path,
+    relative: Path,
+    expected_marker: str | None = None,
+) -> bool:
+    """Recognize only an empty directory or one interrupted canonical marker write."""
+    directory = _lexical_protocol_path(ledger_root, relative, directory=True)
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError as error:
+        raise ValueError("interrupted derived output protocol directory is unsafe") from error
+    if not entries:
+        return True
+    if len(entries) != 1 or entries[0].name != ".protocol-marker":
+        return False
+    marker_path = entries[0]
+    try:
+        mode = os.lstat(marker_path).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            return False
+        interrupted = marker_path.read_bytes()
+    except OSError as error:
+        raise ValueError("interrupted derived output protocol marker is unsafe") from error
+    if expected_marker is not None:
+        canonical = _protocol_marker_text(expected_marker).encode("ascii")
+        return len(interrupted) < len(canonical) and canonical.startswith(interrupted)
+    template = _protocol_marker_text("0" * 64).encode("ascii")
+    token_start = template.index(b"0" * 64)
+    prefix, suffix = template[:token_start], template[token_start + 64:]
+    if len(interrupted) <= len(prefix):
+        return prefix.startswith(interrupted)
+    if not interrupted.startswith(prefix):
+        return False
+    remainder = interrupted[len(prefix):]
+    token = remainder[:64]
+    if any(byte not in b"0123456789abcdef" for byte in token):
+        return False
+    if len(remainder) <= 64:
+        return True
+    ending = remainder[64:]
+    return len(ending) < len(suffix) and suffix.startswith(ending)
+
+
+def _validate_orphan_output_directories(ledger_root: Path) -> tuple[tuple[Path, str | None], ...]:
+    """Preflight all no-journal protocol directories before deleting either one."""
+    orphans: list[tuple[Path, str | None]] = []
+    for relative in (_OUTPUT_BUNDLE_STAGE, _OUTPUT_BUNDLE_BACKUP):
+        path = _lexical_protocol_path(ledger_root, relative)
+        if path.exists() or path.is_symlink():
+            interrupted = _is_interrupted_protocol_directory(ledger_root, relative)
+            marker = None if interrupted else _validate_protocol_directory(ledger_root, relative)
+            orphans.append((relative, marker))
+    if len({marker for _, marker in orphans if marker is not None}) > 1:
+        raise ValueError("orphaned derived output protocol markers do not match")
+    return tuple(orphans)
 
 
 def _validate_staged_artifact(relative: str, path: Path, expected: str) -> None:
@@ -481,15 +644,22 @@ def validate_pending_output_bundle(ledger_root: Path) -> None:
     """Validate an output journal and all staged bytes before any recovery mutation."""
     journal_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_JOURNAL)
     if not journal_path.exists():
+        _validate_orphan_output_directories(ledger_root)
         return
     with journal_path.open("r", encoding="utf-8") as handle:
         journal = json.load(handle)
     if not isinstance(journal, dict) or set(journal) != {"generation", "marker", "targets", "version"} or journal["version"] != 3 or not isinstance(journal["marker"], str) or not _SHA256.fullmatch(journal["marker"]) or not isinstance(journal["targets"], list) or journal.get("generation") != _authoritative_generation(ledger_root):
         raise ValueError("pending derived output journal is invalid")
     stage_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE, directory=True)
-    marker = _marker_path(ledger_root)
-    if not marker.is_file() or marker.is_symlink() or marker.read_text(encoding="ascii") != journal["marker"] + "\n":
-        raise ValueError("pending derived output journal is invalid")
+    _read_protocol_marker(ledger_root, _OUTPUT_BUNDLE_STAGE, str(journal["marker"]))
+    backup_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP)
+    if backup_path.exists() or backup_path.is_symlink():
+        if not _is_interrupted_protocol_directory(
+            ledger_root, _OUTPUT_BUNDLE_BACKUP, str(journal["marker"]),
+        ):
+            _validate_protocol_directory(
+                ledger_root, _OUTPUT_BUNDLE_BACKUP, str(journal["marker"]),
+            )
     targets = journal["targets"]
     if len(targets) != len({str(item.get("relative", "")) for item in targets if isinstance(item, dict)}):
         raise ValueError("pending derived output journal is invalid")
@@ -558,7 +728,13 @@ def validate_pending_output_bundle(ledger_root: Path) -> None:
     ):
         raise ValueError("pending derived output cross-artifact validation failed")
 
-    from .classification import apply_exact_rules, load_rules
+    from .classification import apply_exact_rules, load_chart_contract, load_rules
+    chart_present, chart = load_chart_contract(ledger_root)
+    staged_classified, staged_classification_issues = admit_canonical_transactions(
+        classified, chart, chart_present=chart_present,
+    )
+    if staged_classification_issues or len(staged_classified) != len(classified):
+        raise ValueError("pending derived output cross-artifact validation failed")
     expected_classified = _ordered_transactions(
         apply_exact_rules(tuple(normalized), load_rules(ledger_root)).transactions
     )
@@ -566,7 +742,9 @@ def validate_pending_output_bundle(ledger_root: Path) -> None:
         raise ValueError("pending derived output cross-artifact validation failed")
 
     authoritative_transactions, canonical_load_issues = load_canonical_for_validation(ledger_root)
-    authoritative_valid, canonical_issues = admit_canonical_transactions(authoritative_transactions)
+    authoritative_valid, canonical_issues = admit_canonical_transactions(
+        authoritative_transactions, chart, chart_present=chart_present,
+    )
     authoritative_by_id = {
         row["transaction_id"]: row for row in authoritative_valid
     }
@@ -695,14 +873,26 @@ def validate_pending_output_bundle(ledger_root: Path) -> None:
         raise ValueError("pending derived report is malformed")
 
 
+def _remove_interrupted_protocol_dir(
+    ledger_root: Path,
+    relative: Path,
+    expected_marker: str | None = None,
+) -> None:
+    directory = _lexical_protocol_path(ledger_root, relative, directory=True)
+    if not _is_interrupted_protocol_directory(ledger_root, relative, expected_marker):
+        raise ValueError("interrupted derived output cleanup is unsafe")
+    marker_path = _lexical_protocol_path(ledger_root, relative / ".protocol-marker")
+    try:
+        if marker_path.exists():
+            marker_path.unlink()
+        directory.rmdir()
+    except OSError as error:
+        raise ValueError("interrupted derived output cleanup is unsafe") from error
+
+
 def _remove_protocol_dir(ledger_root: Path, relative: Path, marker: str) -> None:
     directory = _lexical_protocol_path(ledger_root, relative, directory=True)
-    marker_path = _lexical_protocol_path(ledger_root, relative / ".protocol-marker")
-    if not marker_path.is_file() or marker_path.is_symlink() or marker_path.read_text(encoding="ascii") != marker + "\n":
-        raise ValueError("derived output cleanup is unsafe")
-    for current, dirs, files in os.walk(directory, followlinks=False):
-        if any(Path(current, entry).is_symlink() for entry in (*dirs, *files)):
-            raise ValueError("derived output cleanup is unsafe")
+    _validate_protocol_directory(ledger_root, relative, marker)
     shutil.rmtree(directory)
 
 
@@ -710,13 +900,32 @@ def recover_pending_output_bundle(ledger_root: Path) -> None:
     """Finish an interrupted derived-output installation before exposing a new generation."""
     journal_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_JOURNAL)
     if not journal_path.exists():
+        orphans = _validate_orphan_output_directories(ledger_root)
+        for relative, marker in orphans:
+            if marker is None:
+                _remove_interrupted_protocol_dir(ledger_root, relative)
+            else:
+                _remove_protocol_dir(ledger_root, relative, marker)
         return
     validate_pending_output_bundle(ledger_root)
     with journal_path.open("r", encoding="utf-8") as handle:
         journal = json.load(handle)
     stage_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE, directory=True)
     marker = str(journal["marker"])
-    backup_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP, directory=True) if _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP).exists() else None
+    backup_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP)
+    backup_root = None
+    if backup_path.exists() or backup_path.is_symlink():
+        if _is_interrupted_protocol_directory(
+            ledger_root, _OUTPUT_BUNDLE_BACKUP, marker,
+        ):
+            _remove_interrupted_protocol_dir(
+                ledger_root, _OUTPUT_BUNDLE_BACKUP, marker,
+            )
+        else:
+            _validate_protocol_directory(ledger_root, _OUTPUT_BUNDLE_BACKUP, marker)
+            backup_root = _lexical_protocol_path(
+                ledger_root, _OUTPUT_BUNDLE_BACKUP, directory=True,
+            )
     for item in journal["targets"]:
         relative, expected = str(item["relative"]), str(item["sha256"])
         target = _lexical_protocol_path(ledger_root, Path(relative))
@@ -732,7 +941,7 @@ def recover_pending_output_bundle(ledger_root: Path) -> None:
             if backup_root is None:
                 backup_root = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_BACKUP)
                 backup_root.mkdir()
-                (backup_root / ".protocol-marker").write_text(marker + "\n", encoding="ascii")
+                (backup_root / ".protocol-marker").write_text(_protocol_marker_text(marker), encoding="ascii")
             backup.parent.mkdir(parents=True, exist_ok=True)
             os.replace(target, backup)
         os.replace(staged, target)
@@ -752,7 +961,7 @@ def _install_output_bundle(ledger_root: Path, artifacts: Mapping[str, bytes]) ->
         raise ValueError("derived output protocol is not clean")
     stage_root.mkdir(parents=True)
     marker = hashlib.sha256(os.urandom(32)).hexdigest()
-    (stage_root / ".protocol-marker").write_text(marker + "\n", encoding="ascii")
+    (stage_root / ".protocol-marker").write_text(_protocol_marker_text(marker), encoding="ascii")
     targets = []
     try:
         for relative, payload in sorted(artifacts.items()):
@@ -795,10 +1004,13 @@ def publish_derived_outputs(
 ) -> dict[str, object]:
     """Publish one complete deterministic ledger-local view, recovering an old view first."""
     recover_pending_output_bundle(ledger_root)
-    from .classification import apply_exact_rules, load_rules
+    from .classification import apply_exact_rules, load_chart_contract, load_rules
 
     transactions, canonical_load_issues = load_canonical_for_validation(ledger_root)
-    valid_transactions, canonical_issues = admit_canonical_transactions(transactions)
+    chart_present, chart = load_chart_contract(ledger_root)
+    valid_transactions, canonical_issues = admit_canonical_transactions(
+        transactions, chart, chart_present=chart_present,
+    )
     classified = apply_exact_rules(valid_transactions, load_rules(ledger_root))
     classified_rows = _ordered_transactions(classified.transactions)
     if update_canonical and not canonical_load_issues and not canonical_issues and len(classified_rows) == len(transactions):

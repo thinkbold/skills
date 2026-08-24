@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 
 
@@ -48,9 +49,12 @@ class ConsentTests(unittest.TestCase):
             pages=(2,),
             fields=("date", "description", "amount"),
             sensitive_data=("descriptions", "amounts"),
+            purpose="Extract one unreadable statement page for local bookkeeping.",
             retention_risk="Provider retention is unknown.",
             training_risk="Provider training use is unknown.",
             regional_risk="Processing region is unknown.",
+            human_access_risk="Provider human access is unknown.",
+            subprocessor_access_risk="Provider subprocessor access is unknown.",
             redactions=("mask account header",),
             manual_alternative="Enter page 2 into a local CSV template.",
         )
@@ -153,8 +157,10 @@ class ConsentTests(unittest.TestCase):
         """Catches date-only authorization silently admitting populated descriptions and amounts."""
         proposal = create_external_proposal(
             provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date",),
-            sensitive_data=("dates",), retention_risk="Unknown.", training_risk="Unknown.",
-            regional_risk="Unknown.", redactions=("mask account header",),
+            sensitive_data=("dates",), purpose="Extract statement dates for bookkeeping.",
+            retention_risk="Unknown.", training_risk="Unknown.", regional_risk="Unknown.",
+            human_access_risk="Unknown.", subprocessor_access_risk="Unknown.",
+            redactions=("mask account header",),
             manual_alternative="Enter the dates locally.",
         )
         consent_id = self._authorize_proposal(proposal)
@@ -180,8 +186,10 @@ class ConsentTests(unittest.TestCase):
         """Catches a populated description group escaping date-and-amount authorization."""
         proposal = create_external_proposal(
             provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date", "amount"),
-            sensitive_data=("dates", "amounts"), retention_risk="Unknown.", training_risk="Unknown.",
-            regional_risk="Unknown.", redactions=("mask account header",),
+            sensitive_data=("dates", "amounts"), purpose="Extract statement dates and amounts for bookkeeping.",
+            retention_risk="Unknown.", training_risk="Unknown.", regional_risk="Unknown.",
+            human_access_risk="Unknown.", subprocessor_access_risk="Unknown.",
+            redactions=("mask account header",),
             manual_alternative="Enter dates and amounts locally.",
         )
         consent_id = self._authorize_proposal(proposal)
@@ -203,18 +211,46 @@ class ConsentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "operation_id"):
             record_external_decision(self.ledger, replace(self.proposal, pages=(3,)), True, "user")
 
+    def test_persisted_risk_disclosure_edit_requires_a_new_operation_id(self) -> None:
+        """Catches changing purpose or access risks while retaining the operation the user reviewed."""
+        for field, changed in {
+            "purpose": "A different external purpose.",
+            "human_access_risk": "Human access is permitted.",
+            "subprocessor_access_risk": "An undisclosed subprocessor may receive the data.",
+        }.items():
+            with self.subTest(field=field):
+                persisted = proposal_to_dict(self.proposal)
+                persisted[field] = changed
+                with self.assertRaisesRegex(ValueError, "operation_id"):
+                    proposal_from_dict(persisted)
+
+    def test_proposal_requires_purpose_and_each_access_risk(self) -> None:
+        """Catches an incomplete human-facing disclosure receiving an operation identity."""
+        for field in ("purpose", "human_access_risk", "subprocessor_access_risk"):
+            with self.subTest(field=field):
+                persisted = proposal_to_dict(self.proposal)
+                persisted.pop(field)
+                with self.assertRaisesRegex(ValueError, field):
+                    proposal_from_dict(persisted)
+
     def test_cli_rejects_a_persisted_scope_edit_with_retained_operation_id(self) -> None:
         """Catches record-consent appending an edited proposal file that retains an older operation ID."""
         proposal_path = self.ledger / "work" / "proposal.json"
         proposal_path.write_text(json.dumps({
             "provider": PROVIDER, "source_hash": SOURCE_HASH, "pages": [2],
             "fields": ["date", "description", "amount"], "sensitive_data": ["descriptions", "amounts"],
+            "purpose": "Extract one unreadable statement page for local bookkeeping.",
             "retention_risk": "Provider retention is unknown.", "training_risk": "Provider training use is unknown.",
-            "regional_risk": "Processing region is unknown.", "redactions": ["mask account header"],
+            "regional_risk": "Processing region is unknown.",
+            "human_access_risk": "Provider human access is unknown.",
+            "subprocessor_access_risk": "Provider subprocessor access is unknown.",
+            "redactions": ["mask account header"],
             "manual_alternative": "Enter page 2 into a local CSV template.",
         }), encoding="utf-8")
-        with redirect_stdout(StringIO()):
+        proposed_output = StringIO()
+        with redirect_stdout(proposed_output):
             self.assertEqual(0, import_statements.main(["propose-external", str(self.ledger), "work/proposal.json"]))
+        disclosure_digest = json.loads(proposed_output.getvalue())["disclosure_digest"]
         persisted = json.loads(proposal_path.read_text(encoding="utf-8"))
         persisted["pages"] = [3]
         proposal_path.write_text(json.dumps(persisted), encoding="utf-8")
@@ -223,10 +259,25 @@ class ConsentTests(unittest.TestCase):
         with redirect_stdout(output):
             self.assertEqual(3, import_statements.main([
                 "record-consent", str(self.ledger), "work/proposal.json", "--decision", "authorized", "--actor", "user",
+                "--disclosure-digest", disclosure_digest,
             ]))
 
         self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(output.getvalue())["error"])
         self.assertEqual(1, len(read_audit_events(self.ledger)))
+
+    def test_record_consent_rejects_a_digest_not_emitted_by_the_predecision_disclosure(self) -> None:
+        """Catches auditing a decision that is not bound to the exact disclosure shown before the pause."""
+        proposal_path = self.ledger / "work" / "proposal.json"
+        proposal_path.write_text(json.dumps(proposal_to_dict(self.proposal)), encoding="utf-8")
+        audit_before = (self.ledger / "audit" / "audit.jsonl").read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "disclosure digest"):
+            import_statements._record_consent(self.ledger, SimpleNamespace(
+                proposal="work/proposal.json", decision="authorized", actor="user",
+                disclosure_digest="0" * 64,
+            ))
+
+        self.assertEqual(audit_before, (self.ledger / "audit" / "audit.jsonl").read_bytes())
 
     def test_declined_work_is_rejected_before_result_is_read(self) -> None:
         """Catches reading or accepting a result after the user declines its operation."""
@@ -314,8 +365,11 @@ class ConsentTests(unittest.TestCase):
         """Catches a consent audit event retaining statement text supplied in a disclosure alternative."""
         private_proposal = create_external_proposal(
             provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date",),
-            sensitive_data=("descriptions",), retention_risk="Unknown.", training_risk="Unknown.",
-            regional_risk="Unknown.", redactions=("mask account header",),
+            sensitive_data=("descriptions",), purpose="Extract Synthetic merchant from account 123456.",
+            retention_risk="Unknown.", training_risk="Unknown.", regional_risk="Unknown.",
+            human_access_risk="A person may see Synthetic merchant.",
+            subprocessor_access_risk="A processor may see account 123456.",
+            redactions=("mask account header",),
             manual_alternative="Enter Synthetic merchant from account 123456 locally.",
         )
 
@@ -399,8 +453,12 @@ class ConsentTests(unittest.TestCase):
         proposal_path.write_text(json.dumps({
             "provider": PROVIDER, "source_hash": SOURCE_HASH, "pages": [2],
             "fields": ["date", "description", "amount"], "sensitive_data": ["descriptions", "amounts"],
+            "purpose": "Extract one unreadable statement page for local bookkeeping.",
             "retention_risk": "Provider retention is unknown.", "training_risk": "Provider training use is unknown.",
-            "regional_risk": "Processing region is unknown.", "redactions": ["mask account header"],
+            "regional_risk": "Processing region is unknown.",
+            "human_access_risk": "Provider human access is unknown.",
+            "subprocessor_access_risk": "Provider subprocessor access is unknown.",
+            "redactions": ["mask account header"],
             "manual_alternative": "Enter page 2 into a local CSV template.",
         }), encoding="utf-8")
         proposed_output = StringIO()
@@ -408,13 +466,40 @@ class ConsentTests(unittest.TestCase):
             self.assertEqual(0, import_statements.main(["propose-external", str(self.ledger), "work/proposal.json"]))
         disclosed = json.loads(proposed_output.getvalue())
         self.assertEqual(PROVIDER, disclosed["provider"])
-        consent_output = StringIO()
-        with redirect_stdout(consent_output):
-            self.assertEqual(0, import_statements.main([
-                "record-consent", str(self.ledger), "work/proposal.json", "--decision", "authorized", "--actor", "user",
-            ]))
-        consent_record = json.loads(consent_output.getvalue())
-        self.assertEqual(disclosed, consent_record["disclosure"])
+        self.assertEqual(
+            "Extract one unreadable statement page for local bookkeeping.",
+            disclosed.get("purpose"),
+        )
+        self.assertEqual("Provider human access is unknown.", disclosed.get("human_access_risk"))
+        self.assertEqual("Provider subprocessor access is unknown.", disclosed.get("subprocessor_access_risk"))
+        disclosure_digest = str(disclosed.get("disclosure_digest", ""))
+        self.assertRegex(disclosure_digest, r"^[0-9a-f]{64}$")
+        audit_before = (self.ledger / "audit" / "audit.jsonl").read_bytes()
+        missing_digest = subprocess.run([
+            sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"),
+            "record-consent", str(self.ledger), "work/proposal.json",
+            "--decision", "authorized", "--actor", "user",
+        ], capture_output=True, text=True)
+        self.assertEqual(2, missing_digest.returncode)
+        self.assertEqual(audit_before, (self.ledger / "audit" / "audit.jsonl").read_bytes())
+        wrong_digest = subprocess.run([
+            sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"),
+            "record-consent", str(self.ledger), "work/proposal.json",
+            "--decision", "authorized", "--actor", "user",
+            "--disclosure-digest", "0" * 64,
+        ], capture_output=True, text=True)
+        self.assertEqual(3, wrong_digest.returncode)
+        self.assertEqual(audit_before, (self.ledger / "audit" / "audit.jsonl").read_bytes())
+        recorded = subprocess.run([
+            sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"),
+            "record-consent", str(self.ledger), "work/proposal.json",
+            "--decision", "authorized", "--actor", "user",
+            "--disclosure-digest", disclosure_digest,
+        ], capture_output=True, text=True)
+        self.assertEqual(0, recorded.returncode, recorded.stderr)
+        consent_record = json.loads(recorded.stdout)
+        self.assertNotIn("disclosure", consent_record)
+        self.assertEqual(disclosure_digest, consent_record["disclosure_digest"])
         consent_id = consent_record["consent_id"]
         returned = self.ledger / "work" / "external-result.csv"
         returned.write_bytes((FIXTURES / "external-result.csv").read_bytes())
@@ -652,8 +737,10 @@ class ConsentTests(unittest.TestCase):
         second_hash = "b" * 64
         second_proposal = create_external_proposal(
             provider=PROVIDER, source_hash=second_hash, pages=(2,), fields=("date", "description", "amount"),
-            sensitive_data=("descriptions", "amounts"), retention_risk="Unknown.", training_risk="Unknown.",
-            regional_risk="Unknown.", redactions=("mask account header",), manual_alternative="Enter locally.",
+            sensitive_data=("descriptions", "amounts"), purpose="Extract an unrelated statement row.",
+            retention_risk="Unknown.", training_risk="Unknown.", regional_risk="Unknown.",
+            human_access_risk="Unknown.", subprocessor_access_risk="Unknown.",
+            redactions=("mask account header",), manual_alternative="Enter locally.",
         )
         second_id = self._authorize_proposal(second_proposal)
         unrelated = self._write_result("external-unrelated.csv", {
@@ -831,8 +918,10 @@ class ConsentTests(unittest.TestCase):
         first_id = self._authorize()
         second_proposal = create_external_proposal(
             provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date", "description", "amount"),
-            sensitive_data=("descriptions", "amounts"), retention_risk="Unknown.", training_risk="Unknown.",
-            regional_risk="Unknown.", redactions=("mask account header",),
+            sensitive_data=("descriptions", "amounts"), purpose="Extract a separately authorized result.",
+            retention_risk="Unknown.", training_risk="Unknown.", regional_risk="Unknown.",
+            human_access_risk="Unknown.", subprocessor_access_risk="Unknown.",
+            redactions=("mask account header",),
             manual_alternative="Enter page 2 locally.",
         )
         second_id = self._authorize_proposal(second_proposal)

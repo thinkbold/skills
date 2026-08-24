@@ -22,20 +22,20 @@ Do not record authorization before the pause. Do not describe silence, urgency, 
 
 ## Persist the current decision
 
-Create a ledger-local proposal JSON under `work/` with these exact implemented fields: `provider`, `source_hash`, `pages`, `fields`, `sensitive_data`, `retention_risk`, `training_risk`, `regional_risk`, `redactions`, `manual_alternative`. For the current complete canonical return, `fields` must contain exactly `date`, `description`, and `amount`. `propose-external` adds/validates the non-reusable `nonce` and derived `operation_id` and redisplays the proposal:
+Create a ledger-local proposal JSON under `work/` with these exact implemented disclosure fields: `provider`, `source_hash`, `pages`, `fields`, `sensitive_data`, `purpose`, `retention_risk`, `training_risk`, `regional_risk`, `human_access_risk`, `subprocessor_access_risk`, `redactions`, `manual_alternative`. Every field is required; use an explicit `unknown` risk instead of omission. For the current complete canonical return, `fields` must contain exactly `date`, `description`, and `amount`. `propose-external` adds/validates the non-reusable `nonce` and disclosure-derived `operation_id`, then prints the complete normalized disclosure and its `disclosure_digest` before the decision pause:
 
 ```sh
 python <skill>/scripts/import_statements.py propose-external <ledger> work/synthetic-external-proposal.json
 ```
 
-The proposal schema does not have separate purpose or human/subprocessor-access fields, so disclose those explicitly alongside the command output before asking. After the user answers, append that current decision:
+Show that output to the user, ask the decision question, and pause. After the user answers, append the current decision using the exact digest printed before the pause:
 
 ```sh
-python <skill>/scripts/import_statements.py record-consent <ledger> work/synthetic-external-proposal.json --decision authorized --actor user
-python <skill>/scripts/import_statements.py record-consent <ledger> work/synthetic-external-proposal.json --decision declined --actor user
+python <skill>/scripts/import_statements.py record-consent <ledger> work/synthetic-external-proposal.json --decision authorized --actor user --disclosure-digest <digest-from-propose-external>
+python <skill>/scripts/import_statements.py record-consent <ledger> work/synthetic-external-proposal.json --decision declined --actor user --disclosure-digest <digest-from-propose-external>
 ```
 
-Every answer is append-only. A later answer for the same operation supersedes the prior one; an authorization is valid only when its consent event is the latest exact-scope decision.
+`record-consent` does not display the disclosure after the decision. It rejects a missing, edited, or stale digest without writing an event. Every answer is append-only. A later answer for the same operation supersedes the prior one; an authorization is valid only when its consent event is the latest exact-scope decision.
 
 ## User-run provider and local admission
 

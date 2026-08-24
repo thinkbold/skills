@@ -20,6 +20,9 @@ RECONCILIATION_FIELDS = (
     "reported_closing", "difference", "tolerance", "reconciled", "issue_codes",
 )
 ACCOUNT_SUMMARY_FIELDS = ("account_label", "currency", "period_count", "reconciled_period_count", "state")
+OPENING_SOURCE_TYPES = frozenset({
+    "user_provided", "statement_opening", "prior_year_end_statement",
+})
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,13 @@ def reconcile_account_period(
 ) -> ReconciliationRow:
     """Reconcile one account/currency/period using exact Decimal arithmetic."""
     row_issues = list(issues)
+    source_type = opening_source_type.strip() if isinstance(opening_source_type, str) else ""
+    source_type_valid = bool(source_type)
+    if source_type and source_type not in OPENING_SOURCE_TYPES:
+        row_issues.append(_blocking("BALANCE_EVIDENCE_INVALID", "Opening balance source type is unsupported."))
+        source_type_valid = False
+    elif not source_type and opening_balance is not None:
+        row_issues.append(_pending("OPENING_BALANCE_MISSING", "Opening balance source type is required."))
     try:
         _date(period_start)
         _date(period_end)
@@ -169,7 +179,7 @@ def reconcile_account_period(
     )
     if difference is not None and not reconciled:
         row_issues.append(_blocking("RECONCILIATION_DIFFERENCE", "Reported closing balance differs from calculated closing balance."))
-    if opening_source_type == "prior_year_end_statement":
+    if source_type == "prior_year_end_statement":
         try:
             adjacent = _date(opening_source_date) + timedelta(days=1) == _date(period_start)
         except ValueError:
@@ -178,9 +188,11 @@ def reconcile_account_period(
             row_issues.append(_blocking("STATEMENT_COVERAGE_GAP", "Prior-year opening evidence is not continuous with this period."))
             reconciled = False
     return ReconciliationRow(
-        account_id, currency, period_start, period_end, opening, opening_source_type,
+        account_id, currency, period_start, period_end, opening, source_type,
         opening_source_date, inflow_total, outflow_total, expected, closing, difference,
-        parsed_tolerance, reconciled and not any(issue.blocking for issue in row_issues), tuple(row_issues),
+        parsed_tolerance,
+        reconciled and source_type_valid and not any(issue.blocking for issue in row_issues),
+        tuple(row_issues),
     )
 
 
@@ -267,7 +279,8 @@ def reconcile_all(
             local_issues.append(_blocking("BALANCE_EVIDENCE_INVALID", "Balance confirmation must be true or false."))
         elif not confirmed:
             local_issues.append(_pending("BALANCE_UNCONFIRMED", "Balance evidence is not confirmed."))
-        source_type = evidence.get("opening_source_type", "") if isinstance(evidence.get("opening_source_type", ""), str) else ""
+        raw_source_type = evidence.get("opening_source_type", "")
+        source_type = raw_source_type.strip() if isinstance(raw_source_type, str) else ""
         opening_missing = confirmed is False or any(not isinstance(evidence.get(field, ""), str) or not evidence.get(field, "").strip() for field in (
             "opening_balance", "opening_source_type", "opening_source_file", "opening_source_location",
         ))

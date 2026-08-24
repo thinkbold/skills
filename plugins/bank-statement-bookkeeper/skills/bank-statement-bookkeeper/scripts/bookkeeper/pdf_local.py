@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import re
 from typing import Any, Callable
@@ -105,6 +107,32 @@ def _staged_ocr_path(source: Path, work_dir: Path) -> Path:
     return Path(work_dir) / "pdf-ocr" / source_hash / f"{source.stem}-searchable.pdf"
 
 
+def _safe_staged_ocr_path(staged_pdf: Path, work_dir: Path) -> Path:
+    """Return the fixed OCR destination only when every existing component is real."""
+    work_root = Path(os.path.abspath(os.fspath(work_dir)))
+    try:
+        work_mode = os.lstat(work_root).st_mode
+    except FileNotFoundError as error:
+        raise ValueError("OCR work directory is missing") from error
+    if stat.S_ISLNK(work_mode) or not stat.S_ISDIR(work_mode):
+        raise ValueError("OCR work directory is unsafe")
+    staged_pdf = Path(os.path.abspath(os.fspath(staged_pdf)))
+    try:
+        staged_pdf.relative_to(work_root / "pdf-ocr")
+    except ValueError as error:
+        raise ValueError("OCR staging path is outside the work directory") from error
+    for directory in (work_root / "pdf-ocr", staged_pdf.parent):
+        if directory.exists() or directory.is_symlink():
+            mode = os.lstat(directory).st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                raise ValueError("OCR staging ancestor is unsafe")
+    if staged_pdf.exists() or staged_pdf.is_symlink():
+        mode = os.lstat(staged_pdf).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ValueError("OCR staging destination is unsafe")
+    return staged_pdf
+
+
 def extract_pdf_pages(
     source: Path,
     work_dir: Path,
@@ -136,11 +164,14 @@ def extract_pdf_pages(
 
     staged_pdf = _staged_ocr_path(source, work_dir)
     try:
+        staged_pdf = _safe_staged_ocr_path(staged_pdf, work_dir)
         staged_pdf.parent.mkdir(parents=True, exist_ok=True)
+        _safe_staged_ocr_path(staged_pdf, work_dir)
         runner = ocr_runner or run_local_ocr
-        staged_pdf = Path(runner(source, staged_pdf, capabilities.ocrmypdf))
-        if not staged_pdf.resolve().is_relative_to((Path(work_dir) / "pdf-ocr").resolve()):
-            raise ValueError("OCR staging path is outside the ledger work directory")
+        returned = Path(runner(source, staged_pdf, capabilities.ocrmypdf))
+        if Path(os.path.abspath(os.fspath(returned))) != staged_pdf:
+            raise ValueError("OCR runner returned an unexpected staging path")
+        staged_pdf = _safe_staged_ocr_path(staged_pdf, work_dir)
         ocr_pages = _read_pages(staged_pdf, reader)
     except Exception:
         return PdfExtraction((), "local_ocr", (_issue(

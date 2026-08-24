@@ -78,6 +78,51 @@ class ReconciliationTests(unittest.TestCase):
         self.assertTrue(with_tolerance.reconciled)
         self.assertEqual(Decimal("0.01"), with_tolerance.tolerance)
 
+    def test_public_reconciliation_accepts_only_established_opening_source_types(self) -> None:
+        """Catches an invented evidence label authorizing an otherwise matching reconciliation."""
+        direct_rows = tuple(
+            reconcile_account_period(
+                "checking-001", "CAD", Decimal("100.00"), (Decimal("10.00"),), (), Decimal("110.00"),
+                "2026-01-01", "2026-01-31", source_type, "2026-01-01",
+            )
+            for source_type in ("user_provided", "statement_opening")
+        )
+        fabricated = reconcile_account_period(
+            "checking-001", "CAD", Decimal("100.00"), (Decimal("10.00"),), (), Decimal("110.00"),
+            "2026-01-01", "2026-01-31", "made_up_evidence", "2026-01-01",
+        )
+
+        self.assertTrue(all(row.reconciled for row in direct_rows))
+        self.assertFalse(fabricated.reconciled)
+        invalid = tuple(issue for issue in fabricated.issues if issue.code == "BALANCE_EVIDENCE_INVALID")
+        self.assertEqual(1, len(invalid))
+        self.assertTrue(invalid[0].blocking)
+
+    def test_reconcile_all_blocks_unknown_opening_type_but_keeps_missing_opening_pending(self) -> None:
+        """Catches unknown evidence reconciling or absent evidence being promoted to a blocking defect."""
+        activity = (transaction("checking-001", "CAD", "2026-01-03", "10.00", "0"),)
+        fabricated = reconcile_all(activity, (
+            balance(
+                opening_balance="100.00", closing_balance="110.00",
+                opening_source_type="made_up_evidence",
+            ),
+        ))[0]
+        missing = reconcile_all(activity, (
+            balance(
+                opening_balance="", closing_balance="110.00", opening_source_type="",
+                opening_source_file="", opening_source_location="",
+            ),
+        ))[0]
+
+        self.assertFalse(fabricated.reconciled)
+        self.assertTrue(any(
+            issue.code == "BALANCE_EVIDENCE_INVALID" and issue.blocking
+            for issue in fabricated.issues
+        ))
+        self.assertFalse(missing.reconciled)
+        self.assertIn("OPENING_BALANCE_MISSING", {issue.code for issue in missing.issues})
+        self.assertFalse(any(issue.blocking for issue in missing.issues))
+
     def test_prior_year_closing_can_supply_opening_only_with_same_unit_and_continuity(self) -> None:
         """Catches deriving an opening from another currency or a non-adjacent statement."""
         opening = derive_opening_from_prior_statement(

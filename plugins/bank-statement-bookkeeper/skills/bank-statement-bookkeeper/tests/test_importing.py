@@ -16,7 +16,7 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, MERCHANT_RULE_FIELDS, AccountContext
 from bookkeeper.classification import confirm_group, load_transactions, save_transactions
 from bookkeeper.ledger import initialize_ledger
-from bookkeeper.storage import atomic_write_csv, read_audit_events, read_csv_rows
+from bookkeeper.storage import append_audit_event, atomic_write_csv, read_audit_events, read_csv_rows
 from bookkeeper.importing import (
     CsvMapping,
     StatementInventory,
@@ -24,6 +24,7 @@ from bookkeeper.importing import (
     discover_account_candidates,
     normalize_csv_statement,
     parse_decimal,
+    recover_pending_correction,
     stage_manual_correction,
 )
 
@@ -119,6 +120,74 @@ class ImportingTests(unittest.TestCase):
         )
         self.assertEqual("CURRENCY_MISSING", result.issues[0].code)
 
+    def test_csv_parse_issues_keep_boolean_blocking_and_exact_row_provenance(self) -> None:
+        """Catches Issue positional arguments shifting source provenance into the blocking field."""
+        with TemporaryDirectory() as temp:
+            source = Path(temp) / "private-987654.csv"
+            source.write_text(
+                "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+                "2026-01-03,2026-01-03,PRIVATE AMOUNT,not-money,,995.50,R-1\n"
+                "not-a-date,2026-01-04,PRIVATE DATE,5.00,,990.50,R-2\n"
+                "2026-01-05,2026-01-05,PRIVATE BALANCE,5.00,,not-money,R-3\n",
+                encoding="utf-8",
+            )
+
+            result = normalize_csv_statement(
+                source, MAPPING, ACCOUNT, source_identity="inputs/private-987654.csv",
+            )
+
+        self.assertEqual(
+            (("AMOUNT_UNPARSEABLE", "2"), ("DATE_UNPARSEABLE", "3"), ("AMOUNT_UNPARSEABLE", "4")),
+            tuple((issue.code, issue.source_location) for issue in result.issues),
+        )
+        for issue in result.issues:
+            self.assertIs(issue.blocking, True)
+            self.assertEqual("inputs/private-987654.csv", issue.source_file)
+
+    def test_csv_header_and_currency_issues_bind_the_logical_source(self) -> None:
+        """Catches pre-row CSV defects losing their ledger-relative source identity."""
+        with TemporaryDirectory() as temp:
+            source = Path(temp) / "private-header-987654.csv"
+            source.write_text("Date,Description\n2026-01-03,PRIVATE\n", encoding="utf-8")
+            header = normalize_csv_statement(
+                source, MAPPING, ACCOUNT, source_identity="inputs/private-header-987654.csv",
+            ).issues[0]
+            currency = normalize_csv_statement(
+                source, MAPPING,
+                AccountContext("checking-001", "Synthetic Bank", "***1001", ""),
+                source_identity="inputs/private-header-987654.csv",
+            ).issues[0]
+
+        for issue in (header, currency):
+            self.assertIs(issue.blocking, True)
+            self.assertEqual("inputs/private-header-987654.csv", issue.source_file)
+            self.assertEqual("", issue.source_location)
+
+    def test_failed_csv_import_keeps_parse_details_out_of_audit_and_exceptions(self) -> None:
+        """Catches corrected provenance causing statement names or malformed values to leak publicly."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source_name = "private-merchant-987654.csv"
+            (ledger / "inputs" / source_name).write_text(
+                "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+                "2026-01-03,2026-01-03,PRIVATE MERCHANT 987654,not-money,,995.50,R-1\n"
+                "private-date,2026-01-04,PRIVATE MERCHANT 987654,5.00,,990.50,R-2\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                self._csv_command(ledger, f"inputs/{source_name}"),
+                check=True, capture_output=True, text=True,
+            )
+
+            self.assertEqual("blocked", json.loads(completed.stdout)["status"])
+            private_values = (source_name, "PRIVATE MERCHANT 987654", "not-money", "private-date")
+            for path in (ledger / "audit" / "audit.jsonl", ledger / "outputs" / "exceptions.csv"):
+                text = path.read_text(encoding="utf-8")
+                self.assertTrue(all(value not in text for value in private_values))
+            exceptions = read_csv_rows(ledger / "outputs" / "exceptions.csv")
+            self.assertEqual({"AMOUNT_UNPARSEABLE", "DATE_UNPARSEABLE"}, {row["code"] for row in exceptions})
+
     def test_csv_command_is_idempotent_and_correction_preserves_extraction(self) -> None:
         """Catches writing canonical rows outside work or correction replacing extracted provenance."""
         with TemporaryDirectory() as temp:
@@ -149,6 +218,107 @@ class ImportingTests(unittest.TestCase):
             self.assertEqual("2026-01-03", correction_record["original_value"])
             self.assertEqual("2026-01-31", correction_record["corrected_value"])
             self.assertNotIn("raw_description", json.dumps(read_audit_events(ledger)))
+
+    def test_correct_row_cli_rejects_classification_authority_fields_without_mutation(self) -> None:
+        """Catches the generic extraction-correction command bypassing classification authority."""
+        forbidden = {
+            "classification_status": "classified",
+            "account_code": "6100",
+            "account_name": "Membership Fee",
+            "rule_id": "rule-" + "a" * 32,
+        }
+        for field, value in forbidden.items():
+            with self.subTest(field=field), TemporaryDirectory() as temp:
+                ledger = self._configured_ledger(temp)
+                source = ledger / "inputs" / "checking-january.csv"
+                shutil.copyfile(FIXTURES / "checking-january.csv", source)
+                subprocess.run(
+                    self._csv_command(ledger, "inputs/checking-january.csv"),
+                    check=True, capture_output=True, text=True,
+                )
+                transaction_id = read_csv_rows(
+                    ledger / "work" / "normalized-transactions.csv"
+                )[0]["transaction_id"]
+                before = self._ledger_bytes(ledger)
+                rejected = subprocess.run([
+                    sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"),
+                    "correct-row", str(ledger), transaction_id,
+                    "--field", field, "--value", value,
+                    "--reason", "Synthetic authority bypass attempt", "--actor", "user",
+                ], capture_output=True, text=True)
+                self.assertEqual(3, rejected.returncode)
+                self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+                self.assertEqual(before, self._ledger_bytes(ledger))
+
+    def test_normalized_merchant_correction_is_limited_to_unclassified_rows(self) -> None:
+        """Catches merchant recovery rewriting the matching identity of an already classified row."""
+        for status, permitted in (("unclassified", True), ("classified", False)):
+            with self.subTest(status=status), TemporaryDirectory() as temp:
+                ledger = self._configured_ledger(temp)
+                source = ledger / "inputs" / "checking-january.csv"
+                shutil.copyfile(FIXTURES / "checking-january.csv", source)
+                subprocess.run(
+                    self._csv_command(ledger, "inputs/checking-january.csv"),
+                    check=True, capture_output=True, text=True,
+                )
+                canonical = ledger / "work" / "normalized-transactions.csv"
+                rows = read_csv_rows(canonical)
+                if status == "classified":
+                    rows[0].update({
+                        "classification_status": "classified",
+                        "account_name": "Synthetic Category",
+                    })
+                    atomic_write_csv(canonical, CANONICAL_TRANSACTION_FIELDS, rows)
+                before = self._ledger_bytes(ledger)
+                command = [
+                    sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"),
+                    "correct-row", str(ledger), rows[0]["transaction_id"],
+                    "--field", "normalized_merchant", "--value", "RECOVERED MERCHANT",
+                    "--reason", "Synthetic ungroupable recovery", "--actor", "user",
+                ]
+                completed = subprocess.run(command, capture_output=True, text=True)
+                if permitted:
+                    self.assertEqual(0, completed.returncode, completed.stderr)
+                    corrected = read_csv_rows(canonical)[0]
+                    self.assertEqual("RECOVERED MERCHANT", corrected["normalized_merchant"])
+                else:
+                    self.assertEqual(3, completed.returncode)
+                    self.assertEqual(before, self._ledger_bytes(ledger))
+
+    def test_pending_correction_cannot_recover_a_forged_classification_field(self) -> None:
+        """Catches a self-consistent recovery journal bypassing the public correction field boundary."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source = ledger / "inputs" / "checking-january.csv"
+            shutil.copyfile(FIXTURES / "checking-january.csv", source)
+            subprocess.run(
+                self._csv_command(ledger, "inputs/checking-january.csv"),
+                check=True, capture_output=True, text=True,
+            )
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            rows = read_csv_rows(canonical)
+            stage_manual_correction(
+                ledger, tuple(rows), rows[0]["transaction_id"], "posting_date",
+                "2026-01-31", "Synthetic staged correction", "user",
+            )
+            staged_path = ledger / "work" / "pending-correction.csv"
+            staged = read_csv_rows(staged_path)
+            staged[0]["classification_status"] = "classified"
+            atomic_write_csv(staged_path, CANONICAL_TRANSACTION_FIELDS, staged)
+            journal_path = ledger / "work" / "pending-correction.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            journal["expected_canonical_sha256"] = hashlib.sha256(staged_path.read_bytes()).hexdigest()
+            journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n", encoding="utf-8")
+            before = self._ledger_bytes(ledger)
+
+            rejected = subprocess.run(
+                self._classification_command("pending", str(ledger)),
+                capture_output=True, text=True,
+            )
+
+            self.assertEqual(3, rejected.returncode)
+            self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+            self.assertEqual(before, self._ledger_bytes(ledger))
 
     def test_csv_replaces_changed_logical_source_and_keeps_same_basenames_distinct(self) -> None:
         """Catches stale rows after a changed source or collisions between separate statement paths."""
@@ -614,36 +784,14 @@ class ImportingTests(unittest.TestCase):
                 "".join(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n" for event in events),
                 encoding="utf-8",
             )
-            second = confirm_group(
-                ledger, first.transactions, "LEGACY MERCHANT", "outflow", "", "Legacy Category", True, "user",
-                (original[1]["transaction_id"],),
-            )
-            save_transactions(ledger, second.transactions)
-            self.assertEqual((), second.created_rules)
-            self.assertEqual(rule_id, second.transactions[1]["rule_id"])
-            latest_event = next(event for event in read_audit_events(ledger) if event["event_id"] == second.audit_event_ids[0])
-            self.assertEqual(rule_id, latest_event["payload"]["rule_id"])
-            rule = read_csv_rows(ledger / "merchant-rules.csv")[0]
-            self.assertEqual(legacy_event_id, rule["audit_event_id"])
-
-            manifest_path = ledger / "work" / "import-manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            source = "inputs/a.csv"
-            snapshot_path = ledger / manifest["source_contributions"][source]["path"]
-            snapshot_rows = read_csv_rows(snapshot_path)
-            retained_snapshot = next(
-                row for row in snapshot_rows if row["transaction_id"] == original[1]["transaction_id"]
-            )
-            atomic_write_csv(snapshot_path, CANONICAL_TRANSACTION_FIELDS, (retained_snapshot,))
-            manifest["source_contributions"][source]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
-            manifest["transaction_count"] = 1
-            manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-            retained_current = next(
-                row for row in second.transactions if row["transaction_id"] == original[1]["transaction_id"]
-            )
-            atomic_write_csv(
-                ledger / "work" / "normalized-transactions.csv", CANONICAL_TRANSACTION_FIELDS, (retained_current,),
-            )
+            expected = self._ledger_bytes(ledger)
+            with self.assertRaisesRegex(ValueError, "audit authorization"):
+                confirm_group(
+                    ledger, first.transactions, "LEGACY MERCHANT", "outflow", "", "Legacy Category", True, "user",
+                    (original[1]["transaction_id"],),
+                )
+            self.assertEqual(expected, self._ledger_bytes(ledger))
+            self.assertEqual(rule_id, read_csv_rows(ledger / "merchant-rules.csv")[0]["rule_id"])
             (ledger / "inputs" / "b.csv").write_text(
                 header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,967.00,B-1\n",
                 encoding="utf-8",
@@ -700,6 +848,204 @@ class ImportingTests(unittest.TestCase):
             self.assertEqual(1, len((ledger / "work" / "corrections.jsonl").read_text(encoding="utf-8").splitlines()))
             subprocess.run(rerun, check=True, capture_output=True, text=True)
             self.assertEqual(1, len((ledger / "work" / "corrections.jsonl").read_text(encoding="utf-8").splitlines()))
+
+    def test_pending_correction_recovers_after_canonical_replace_before_audit_append(self) -> None:
+        """Catches the real crash window where os.replace consumed the staged correction before audit append."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source = ledger / "inputs" / "checking-january.csv"
+            shutil.copyfile(FIXTURES / "checking-january.csv", source)
+            subprocess.run(
+                self._csv_command(ledger, "inputs/checking-january.csv"),
+                check=True, capture_output=True, text=True,
+            )
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            original = read_csv_rows(canonical)
+            stage_manual_correction(
+                ledger, tuple(original), original[0]["transaction_id"], "posting_date", "2026-01-31",
+                "Confirmed post-replace crash", "user",
+            )
+            staged = ledger / "work" / "pending-correction.csv"
+            journal = ledger / "work" / "pending-correction.json"
+            staged.replace(canonical)
+            self.assertFalse(staged.exists())
+
+            recover_pending_correction(ledger)
+
+            self.assertEqual("2026-01-31", read_csv_rows(canonical)[0]["posting_date"])
+            self.assertFalse(journal.exists())
+            manual_events = [
+                event for event in read_audit_events(ledger)
+                if event["event_type"] == "manual_correction_recorded"
+            ]
+            self.assertEqual(1, len(manual_events))
+            self.assertEqual(
+                manual_events[0]["event_id"],
+                json.loads((ledger / "work" / "corrections.jsonl").read_text(encoding="utf-8"))["event_id"],
+            )
+            recovered = self._ledger_bytes(ledger)
+
+            recover_pending_correction(ledger)
+
+            self.assertEqual(recovered, self._ledger_bytes(ledger))
+
+    def test_missing_staged_correction_with_nonexpected_canonical_is_zero_mutation(self) -> None:
+        """Catches a missing staged file authorizing recovery while canonical is still base or independently changed."""
+        for state in ("base", "changed"):
+            with self.subTest(state=state), TemporaryDirectory() as temp:
+                ledger = self._configured_ledger(temp)
+                source = ledger / "inputs" / "checking-january.csv"
+                shutil.copyfile(FIXTURES / "checking-january.csv", source)
+                subprocess.run(
+                    self._csv_command(ledger, "inputs/checking-january.csv"),
+                    check=True, capture_output=True, text=True,
+                )
+                canonical = ledger / "work" / "normalized-transactions.csv"
+                original = read_csv_rows(canonical)
+                stage_manual_correction(
+                    ledger, tuple(original), original[0]["transaction_id"], "posting_date", "2026-01-31",
+                    "Confirmed conflict probe", "user",
+                )
+                (ledger / "work" / "pending-correction.csv").unlink()
+                if state == "changed":
+                    changed = read_csv_rows(canonical)
+                    changed[0]["posting_date"] = "2026-01-30"
+                    atomic_write_csv(canonical, CANONICAL_TRANSACTION_FIELDS, changed)
+                before = self._ledger_bytes(ledger)
+
+                with self.assertRaises(ValueError):
+                    recover_pending_correction(ledger)
+
+                self.assertEqual(before, self._ledger_bytes(ledger))
+
+    def test_post_replace_record_mismatch_is_zero_mutation(self) -> None:
+        """Catches an installed canonical file bypassing correction-record and audit-payload binding checks."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source = ledger / "inputs" / "checking-january.csv"
+            shutil.copyfile(FIXTURES / "checking-january.csv", source)
+            subprocess.run(
+                self._csv_command(ledger, "inputs/checking-january.csv"),
+                check=True, capture_output=True, text=True,
+            )
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            original = read_csv_rows(canonical)
+            stage_manual_correction(
+                ledger, tuple(original), original[0]["transaction_id"], "posting_date", "2026-01-31",
+                "Confirmed record mismatch probe", "user",
+            )
+            (ledger / "work" / "pending-correction.csv").replace(canonical)
+            journal_path = ledger / "work" / "pending-correction.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            journal["correction_record"]["corrected_value"] = "2026-01-30"
+            journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n", encoding="utf-8")
+            before = self._ledger_bytes(ledger)
+
+            with self.assertRaises(ValueError):
+                recover_pending_correction(ledger)
+
+            self.assertEqual(before, self._ledger_bytes(ledger))
+
+    def test_post_replace_retry_after_audit_append_is_exactly_once(self) -> None:
+        """Catches retry duplicating an audit event after the canonical and audit steps already completed."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source = ledger / "inputs" / "checking-january.csv"
+            shutil.copyfile(FIXTURES / "checking-january.csv", source)
+            subprocess.run(
+                self._csv_command(ledger, "inputs/checking-january.csv"),
+                check=True, capture_output=True, text=True,
+            )
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            original = read_csv_rows(canonical)
+            stage_manual_correction(
+                ledger, tuple(original), original[0]["transaction_id"], "posting_date", "2026-01-31",
+                "Confirmed audit retry", "user",
+            )
+            (ledger / "work" / "pending-correction.csv").replace(canonical)
+            journal = json.loads((ledger / "work" / "pending-correction.json").read_text(encoding="utf-8"))
+            append_audit_event(
+                ledger, "manual_correction_recorded", journal["audit_payload"],
+                actor=journal["correction_record"]["actor"],
+                dedupe_key=f"manual-correction:{journal['event_id']}",
+                event_id=journal["event_id"],
+            )
+
+            recover_pending_correction(ledger)
+            recovered = self._ledger_bytes(ledger)
+            recover_pending_correction(ledger)
+
+            self.assertEqual(recovered, self._ledger_bytes(ledger))
+            self.assertEqual(1, len([
+                event for event in read_audit_events(ledger)
+                if event["event_type"] == "manual_correction_recorded"
+            ]))
+            self.assertEqual(1, len(
+                (ledger / "work" / "corrections.jsonl").read_text(encoding="utf-8").splitlines()
+            ))
+
+    def test_post_replace_existing_correction_record_mismatch_is_zero_mutation(self) -> None:
+        """Catches recovery treating a conflicting same-ID correction record as already completed."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source = ledger / "inputs" / "checking-january.csv"
+            shutil.copyfile(FIXTURES / "checking-january.csv", source)
+            subprocess.run(
+                self._csv_command(ledger, "inputs/checking-january.csv"),
+                check=True, capture_output=True, text=True,
+            )
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            original = read_csv_rows(canonical)
+            stage_manual_correction(
+                ledger, tuple(original), original[0]["transaction_id"], "posting_date", "2026-01-31",
+                "Confirmed stored-record mismatch", "user",
+            )
+            (ledger / "work" / "pending-correction.csv").replace(canonical)
+            journal = json.loads((ledger / "work" / "pending-correction.json").read_text(encoding="utf-8"))
+            conflicting = dict(journal["correction_record"])
+            conflicting["reason"] = "Different reason"
+            (ledger / "work" / "corrections.jsonl").write_text(
+                json.dumps(conflicting, sort_keys=True) + "\n", encoding="utf-8",
+            )
+            before = self._ledger_bytes(ledger)
+
+            with self.assertRaises(ValueError):
+                recover_pending_correction(ledger)
+
+            self.assertEqual(before, self._ledger_bytes(ledger))
+
+    def test_post_replace_existing_audit_mismatch_is_zero_mutation(self) -> None:
+        """Catches recovery accepting a same-ID audit event whose payload does not match the journal."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            source = ledger / "inputs" / "checking-january.csv"
+            shutil.copyfile(FIXTURES / "checking-january.csv", source)
+            subprocess.run(
+                self._csv_command(ledger, "inputs/checking-january.csv"),
+                check=True, capture_output=True, text=True,
+            )
+            canonical = ledger / "work" / "normalized-transactions.csv"
+            original = read_csv_rows(canonical)
+            stage_manual_correction(
+                ledger, tuple(original), original[0]["transaction_id"], "posting_date", "2026-01-31",
+                "Confirmed stored-audit mismatch", "user",
+            )
+            (ledger / "work" / "pending-correction.csv").replace(canonical)
+            journal = json.loads((ledger / "work" / "pending-correction.json").read_text(encoding="utf-8"))
+            conflicting_payload = dict(journal["audit_payload"])
+            conflicting_payload["reason_sha256"] = "0" * 64
+            append_audit_event(
+                ledger, "manual_correction_recorded", conflicting_payload,
+                actor=journal["correction_record"]["actor"],
+                dedupe_key=f"manual-correction:{journal['event_id']}",
+                event_id=journal["event_id"],
+            )
+            before = self._ledger_bytes(ledger)
+
+            with self.assertRaises(ValueError):
+                recover_pending_correction(ledger)
+
+            self.assertEqual(before, self._ledger_bytes(ledger))
 
 
 if __name__ == "__main__":
