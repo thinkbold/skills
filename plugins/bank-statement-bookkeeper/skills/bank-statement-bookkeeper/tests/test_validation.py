@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+import csv
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -16,9 +20,123 @@ from bookkeeper.contracts import Issue, RunState
 from bookkeeper.ledger import initialize_ledger
 from bookkeeper.classification import save_transactions
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, BALANCE_FIELDS
-from bookkeeper.storage import atomic_write_csv
+from bookkeeper.storage import atomic_write_csv, replace_active_issues
 from bookkeeper.reconciliation import reconcile_account_period
-from bookkeeper.validation import _masked_message, collect_ledger_issues, determine_run_state, finalize_outputs
+from bookkeeper.validation import _masked_message, collect_ledger_issues, determine_run_state, finalize_outputs, publish_derived_outputs
+
+
+_DERIVED_TARGETS = (
+    "outputs/account-summary.csv",
+    "outputs/classified-transactions.csv",
+    "outputs/exceptions.csv",
+    "outputs/normalized-transactions.csv",
+    "outputs/reconciliation-report.md",
+    "outputs/reconciliation.csv",
+    "work/pending-merchant-groups.csv",
+    "outputs/status.json",
+)
+_GENERATION_INPUTS = (
+    "work/normalized-transactions.csv",
+    "merchant-rules.csv",
+    "work/active-issues.json",
+    "inputs/account-balances.csv",
+    "ledger.json",
+    "work/import-manifest.json",
+    "audit/audit.jsonl",
+)
+
+
+def _valid_transaction(
+    *,
+    transaction_id: str = "synthetic-1",
+    raw_description: str = "Synthetic merchant",
+) -> dict[str, str]:
+    row = {field: "" for field in CANONICAL_TRANSACTION_FIELDS}
+    row.update({
+        "transaction_id": transaction_id,
+        "account_id": "checking-001",
+        "currency": "CAD",
+        "transaction_date": "2026-01-03",
+        "posting_date": "2026-01-03",
+        "raw_description": raw_description,
+        "inflow": "10.00",
+        "outflow": "0",
+        "running_balance": "110.00",
+        "reference": "synthetic-reference",
+        "source_file": "inputs/synthetic.csv",
+        "source_page_or_row": "2",
+        "extraction_method": "csv",
+        "extraction_confidence": "high",
+        "classification_status": "unclassified",
+        "source_locations": "inputs/synthetic.csv:2",
+    })
+    return row
+
+
+def _valid_balance() -> dict[str, str]:
+    row = {field: "" for field in BALANCE_FIELDS}
+    row.update({
+        "account_id": "checking-001",
+        "currency": "CAD",
+        "period_start": "2026-01-01",
+        "period_end": "2026-01-31",
+        "opening_balance": "100.00",
+        "closing_balance": "110.00",
+        "opening_source_type": "user_provided",
+        "opening_source_file": "inputs/synthetic-balance.txt",
+        "opening_source_location": "1",
+        "closing_source_file": "inputs/synthetic.csv",
+        "closing_source_location": "3",
+        "confirmed": "true",
+    })
+    return row
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _stage_current_generation(ledger: Path, mutate: Callable[[Path], None]) -> None:
+    stage = ledger / "work" / "pending-derived-output-stage"
+    stage.mkdir()
+    marker = "a" * 64
+    (stage / ".protocol-marker").write_text(marker + "\n", encoding="ascii")
+    for relative in _DERIVED_TARGETS:
+        target = stage / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ledger / relative, target)
+    mutate(stage)
+
+    status_path = stage / "outputs" / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["output_hashes"] = {
+        relative: _sha256(stage / relative)
+        for relative in _DERIVED_TARGETS
+        if relative != "outputs/status.json"
+    }
+    for relative in ("work/import-manifest.json", "audit/audit.jsonl"):
+        path = ledger / relative
+        if path.exists():
+            status["output_hashes"][relative] = _sha256(path)
+    status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    generation = {
+        relative: _sha256(ledger / relative) if (ledger / relative).exists() else "absent"
+        for relative in _GENERATION_INPUTS
+    }
+    targets = [
+        {"relative": relative, "sha256": _sha256(stage / relative)}
+        for relative in _DERIVED_TARGETS
+    ]
+    (ledger / "work" / "pending-derived-output.json").write_text(
+        json.dumps({"generation": generation, "marker": marker, "targets": targets, "version": 3}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 class ValidationTests(unittest.TestCase):
@@ -144,6 +262,261 @@ class ValidationTests(unittest.TestCase):
         from bookkeeper.validation import count_pending_classifications, validate_canonical_transactions
         self.assertIn("CURRENCY_MISSING", {issue.code for issue in validate_canonical_transactions((malformed,))})
         self.assertEqual(1, count_pending_classifications((orphaned,)))
+
+    def test_public_validation_keeps_ungroupable_unclassified_row_pending(self) -> None:
+        """Catches a valid unclassified row being rejected because punctuation yields no merchant group."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            save_transactions(ledger, (_valid_transaction(raw_description="!!!"),))
+
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            status = json.loads(result.stdout)
+            self.assertEqual("classification_pending", status["state"])
+            self.assertEqual(1, status["pending_group_count"])
+            self.assertEqual([], _read_csv(ledger / "work" / "pending-merchant-groups.csv"))
+
+    def test_current_generation_cannot_claim_an_empty_ledger_is_complete(self) -> None:
+        """Catches recovery trusting a self-consistent status/report instead of recomputing run state."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            publish_derived_outputs(ledger)
+
+            def claim_complete(stage: Path) -> None:
+                status_path = stage / "outputs" / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                status["state"] = "complete"
+                status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                (stage / "outputs" / "reconciliation-report.md").write_text(
+                    "Run state: complete\n",
+                    encoding="utf-8",
+                )
+
+            _stage_current_generation(ledger, claim_complete)
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+
+    def test_current_generation_binds_classified_rows_to_normalized_evidence(self) -> None:
+        """Catches a classified view changing immutable provenance while retaining the same ID."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            save_transactions(ledger, (_valid_transaction(),))
+            publish_derived_outputs(ledger)
+
+            def substitute_provenance(stage: Path) -> None:
+                path = stage / "outputs" / "classified-transactions.csv"
+                row = _read_csv(path)[0]
+                row["source_locations"] = "inputs/substituted.csv:99"
+                atomic_write_csv(path, CANONICAL_TRANSACTION_FIELDS, (row,))
+
+            _stage_current_generation(ledger, substitute_provenance)
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+
+    def test_current_generation_binds_both_transaction_views_to_authoritative_provenance(self) -> None:
+        """Catches synchronized provenance substitution across normalized and classified artifacts."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            save_transactions(ledger, (_valid_transaction(),))
+            publish_derived_outputs(ledger)
+
+            def substitute_both_views(stage: Path) -> None:
+                for relative in (
+                    "outputs/normalized-transactions.csv",
+                    "outputs/classified-transactions.csv",
+                ):
+                    path = stage / relative
+                    row = _read_csv(path)[0]
+                    row["source_locations"] = "inputs/substituted.csv:99"
+                    atomic_write_csv(path, CANONICAL_TRANSACTION_FIELDS, (row,))
+
+            _stage_current_generation(ledger, substitute_both_views)
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+
+    def test_current_generation_cannot_fabricate_reconciled_complete_artifacts(self) -> None:
+        """Catches internally consistent reconciliation artifacts replacing missing balance evidence."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            row = _valid_transaction()
+            row.update({
+                "classification_status": "classified",
+                "normalized_merchant": "SYNTHETIC MERCHANT",
+                "account_name": "Synthetic category",
+            })
+            save_transactions(ledger, (row,))
+            publish_derived_outputs(ledger)
+
+            def fabricate_complete(stage: Path) -> None:
+                reconciliation_path = stage / "outputs" / "reconciliation.csv"
+                reconciliation = _read_csv(reconciliation_path)[0]
+                reconciliation.update({
+                    "opening_source_type": "user_provided",
+                    "opening_source_date": "2026-01-01",
+                    "opening_balance": "100.00",
+                    "inflows": "10.00",
+                    "outflows": "0",
+                    "expected_closing": "110.00",
+                    "reported_closing": "110.00",
+                    "difference": "0.00",
+                    "tolerance": "",
+                    "reconciled": "true",
+                    "issue_codes": "",
+                })
+                atomic_write_csv(reconciliation_path, tuple(reconciliation), (reconciliation,))
+                summary_path = stage / "outputs" / "account-summary.csv"
+                summary = _read_csv(summary_path)[0]
+                summary.update({"reconciled_period_count": "1", "state": "complete"})
+                atomic_write_csv(summary_path, tuple(summary), (summary,))
+                atomic_write_csv(
+                    stage / "outputs" / "exceptions.csv",
+                    ("code", "blocking", "message", "source_file", "source_location"),
+                    (),
+                )
+                (stage / "outputs" / "reconciliation-report.md").write_text(
+                    "Run state: complete\n",
+                    encoding="utf-8",
+                )
+                status_path = stage / "outputs" / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                status.update({
+                    "blocking_issue_count": 0,
+                    "reconciled_unit_count": 1,
+                    "state": "complete",
+                    "unit_count": 1,
+                })
+                status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            _stage_current_generation(ledger, fabricate_complete)
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+
+    def test_current_generation_cannot_demote_an_authoritative_blocking_issue(self) -> None:
+        """Catches a staged exception changing a production blocking issue to nonblocking."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            row = _valid_transaction()
+            row.update({
+                "classification_status": "classified",
+                "normalized_merchant": "SYNTHETIC MERCHANT",
+                "account_name": "Synthetic category",
+            })
+            save_transactions(ledger, (row,))
+            atomic_write_csv(
+                ledger / "inputs" / "account-balances.csv",
+                BALANCE_FIELDS,
+                (_valid_balance(),),
+            )
+            replace_active_issues(
+                ledger,
+                "import",
+                {"source": "synthetic"},
+                (Issue("CURRENCY_MISSING", "Synthetic currency is missing.", True),),
+            )
+            publish_derived_outputs(ledger)
+
+            def demote_blocker(stage: Path) -> None:
+                exceptions_path = stage / "outputs" / "exceptions.csv"
+                exceptions = _read_csv(exceptions_path)
+                for exception in exceptions:
+                    if exception["code"] == "CURRENCY_MISSING":
+                        exception["blocking"] = "false"
+                atomic_write_csv(exceptions_path, tuple(exceptions[0]), exceptions)
+                summary_path = stage / "outputs" / "account-summary.csv"
+                summary = _read_csv(summary_path)[0]
+                summary["state"] = "complete"
+                atomic_write_csv(summary_path, tuple(summary), (summary,))
+                (stage / "outputs" / "reconciliation-report.md").write_text(
+                    "Run state: complete\n",
+                    encoding="utf-8",
+                )
+                status_path = stage / "outputs" / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                status.update({"blocking_issue_count": 0, "state": "complete"})
+                status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            _stage_current_generation(ledger, demote_blocker)
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+
+    def test_current_generation_rejects_duplicate_group_currency(self) -> None:
+        """Catches a group repeating a currency while preserving superficial counts and finite totals."""
+        self._assert_malicious_group_rejected(
+            currencies="CAD|CAD",
+            totals_by_currency="CAD:10.00|CAD:10.00",
+        )
+
+    def test_current_generation_rejects_group_total_not_derived_from_transactions(self) -> None:
+        """Catches a group claiming a finite but incorrect currency total."""
+        self._assert_malicious_group_rejected(
+            currencies="CAD",
+            totals_by_currency="CAD:999.00",
+        )
+
+    def _assert_malicious_group_rejected(self, *, currencies: str, totals_by_currency: str) -> None:
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            save_transactions(ledger, (_valid_transaction(),))
+            publish_derived_outputs(ledger)
+
+            def mutate_group(stage: Path) -> None:
+                path = stage / "work" / "pending-merchant-groups.csv"
+                row = _read_csv(path)[0]
+                row["currencies"] = currencies
+                row["totals_by_currency"] = totals_by_currency
+                atomic_write_csv(path, tuple(row), (row,))
+
+            _stage_current_generation(ledger, mutate_group)
+            result = subprocess.run(
+                [sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(3, result.returncode)
+            self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
 
     def test_full_canonical_contract_rejects_structure_status_and_provenance(self) -> None:
         """Catches malformed schema/status/provenance rows bypassing final validation."""

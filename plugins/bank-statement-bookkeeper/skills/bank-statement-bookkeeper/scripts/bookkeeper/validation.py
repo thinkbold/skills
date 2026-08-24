@@ -244,6 +244,56 @@ def _ordered_transactions(rows: Iterable[Mapping[str, str]]) -> tuple[dict[str, 
     )))
 
 
+def _pending_group_rows(rows: tuple[dict[str, str], ...]) -> tuple[dict[str, str], ...]:
+    from .classification import build_pending_groups
+
+    return tuple({
+        "group_id": group.group_id,
+        "normalized_merchant": group.normalized_merchant,
+        "direction": group.direction,
+        "currencies": "|".join(group.currencies),
+        "account_ids": "|".join(group.account_ids),
+        "transaction_count": str(group.transaction_count),
+        "totals_by_currency": "|".join(
+            f"{currency}:{amount}" for currency, amount in group.totals_by_currency
+        ),
+        "date_start": group.date_start,
+        "date_end": group.date_end,
+        "confidence": group.confidence,
+    } for group in build_pending_groups(rows))
+
+
+def _parsed_reconciliation_rows(rows: Iterable[Mapping[str, str]]) -> tuple[ReconciliationRow, ...]:
+    def optional_money(value: str) -> Decimal | None:
+        return Decimal(value) if value else None
+
+    parsed: list[ReconciliationRow] = []
+    for row in rows:
+        issues = tuple(
+            Issue(code, f"Issue: {code}", code in _BLOCKING_CODES)
+            for code in row["issue_codes"].split("|")
+            if code
+        )
+        parsed.append(ReconciliationRow(
+            account_id=row["account_label"],
+            currency=row["currency"],
+            period_start=row["period_start"],
+            period_end=row["period_end"],
+            opening_balance=optional_money(row["opening_balance"]),
+            opening_source_type=row["opening_source_type"],
+            opening_source_date=row["opening_source_date"],
+            inflows=Decimal(row["inflows"]),
+            outflows=Decimal(row["outflows"]),
+            expected_closing=optional_money(row["expected_closing"]),
+            reported_closing=optional_money(row["reported_closing"]),
+            difference=optional_money(row["difference"]),
+            tolerance=optional_money(row["tolerance"]),
+            reconciled=row["reconciled"] == "true",
+            issues=issues,
+        ))
+    return tuple(parsed)
+
+
 def _reconciliation_artifacts(rows: tuple[ReconciliationRow, ...], state: RunState) -> dict[str, bytes]:
     ordered = tuple(sorted(rows, key=lambda row: (row.account_id, row.currency, row.period_start, row.period_end)))
     reconciliation = []
@@ -472,20 +522,176 @@ def validate_pending_output_bundle(ledger_root: Path) -> None:
             expected_hashes[relative] = sha256_file(path)
     if status.get("output_hashes") != expected_hashes:
         raise ValueError("pending derived status is malformed")
-    def artifact_rows(relative: str) -> list[dict[str, str]]:
+    def artifact_path(relative: str) -> Path:
         candidate = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
         if not candidate.exists():
             candidate = _lexical_protocol_path(ledger_root, Path(relative))
-        with candidate.open("r", encoding="utf-8", newline="") as handle:
+        return candidate
+
+    def artifact_rows(relative: str) -> list[dict[str, str]]:
+        with artifact_path(relative).open("r", encoding="utf-8", newline="") as handle:
             return list(csv.DictReader(handle))
-    normalized, classified = artifact_rows("outputs/normalized-transactions.csv"), artifact_rows("outputs/classified-transactions.csv")
-    groups, reconciliation, summary, exceptions = (artifact_rows(relative) for relative in ("work/pending-merchant-groups.csv", "outputs/reconciliation.csv", "outputs/account-summary.csv", "outputs/exceptions.csv"))
-    if {row["transaction_id"] for row in normalized} != {row["transaction_id"] for row in classified} or len(normalized) != len(classified) or status["has_transactions"] != bool(normalized) or status["pending_group_count"] != sum(int(row["transaction_count"]) for row in groups) or status["unit_count"] != len(reconciliation) or status["reconciled_unit_count"] != sum(row["reconciled"] == "true" for row in reconciliation) or status["blocking_issue_count"] != sum(row["blocking"] == "true" for row in exceptions) or {(row["account_label"], row["currency"]): (int(row["period_count"]), int(row["reconciled_period_count"])) for row in summary} != {(key[0], key[1]): (sum((row["account_label"], row["currency"]) == key for row in reconciliation), sum((row["account_label"], row["currency"]) == key and row["reconciled"] == "true" for row in reconciliation)) for key in {(row["account_label"], row["currency"]) for row in reconciliation}}:
+    normalized = artifact_rows("outputs/normalized-transactions.csv")
+    classified = artifact_rows("outputs/classified-transactions.csv")
+    groups, reconciliation, summary, exceptions = (
+        artifact_rows(relative)
+        for relative in (
+            "work/pending-merchant-groups.csv",
+            "outputs/reconciliation.csv",
+            "outputs/account-summary.csv",
+            "outputs/exceptions.csv",
+        )
+    )
+
+    normalized_by_id = {row["transaction_id"]: row for row in normalized}
+    classified_by_id = {row["transaction_id"]: row for row in classified}
+    if set(normalized_by_id) != set(classified_by_id) or len(normalized) != len(classified):
         raise ValueError("pending derived output cross-artifact validation failed")
-    report_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / "outputs/reconciliation-report.md")
-    if not report_path.exists():
-        report_path = _lexical_protocol_path(ledger_root, Path("outputs/reconciliation-report.md"))
-    if not report_path.read_text(encoding="utf-8").startswith(f"Run state: {status['state']}\n"):
+    classification_fields = {
+        "normalized_merchant", "classification_status", "account_code",
+        "account_name", "rule_id", "review_note",
+    }
+    immutable_fields = set(CANONICAL_TRANSACTION_FIELDS) - classification_fields
+    if any(
+        any(normalized_by_id[transaction_id][field] != classified_by_id[transaction_id][field] for field in immutable_fields)
+        for transaction_id in normalized_by_id
+    ):
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    from .classification import apply_exact_rules, load_rules
+    expected_classified = _ordered_transactions(
+        apply_exact_rules(tuple(normalized), load_rules(ledger_root)).transactions
+    )
+    if tuple(classified) != expected_classified:
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    authoritative_transactions, canonical_load_issues = load_canonical_for_validation(ledger_root)
+    authoritative_valid, canonical_issues = admit_canonical_transactions(authoritative_transactions)
+    authoritative_by_id = {
+        row["transaction_id"]: row for row in authoritative_valid
+    }
+    if set(normalized_by_id) != set(authoritative_by_id) or any(
+        any(normalized_by_id[transaction_id][field] != authoritative_by_id[transaction_id][field] for field in immutable_fields)
+        for transaction_id in normalized_by_id
+    ):
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    authoritative_classification = apply_exact_rules(
+        authoritative_valid,
+        load_rules(ledger_root),
+    )
+    authoritative_classified = _ordered_transactions(authoritative_classification.transactions)
+    if tuple(classified) != authoritative_classified:
+        raise ValueError("pending derived output cross-artifact validation failed")
+    expected_groups = _pending_group_rows(tuple(classified))
+    if tuple(groups) != expected_groups:
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    pending_count = count_pending_classifications(classified)
+    grouped_count = sum(int(row["transaction_count"]) for row in groups)
+    if grouped_count > pending_count:
+        raise ValueError("pending derived output cross-artifact validation failed")
+    balance_rows, balance_issues = load_balance_rows(ledger_root)
+    authoritative_reconciliation = reconcile_all(authoritative_classified, balance_rows)
+    authoritative_issues = collect_ledger_issues(
+        (
+            *load_active_issues(ledger_root),
+            *canonical_load_issues,
+            *canonical_issues,
+            *authoritative_classification.issues,
+            *balance_issues,
+        ),
+        authoritative_reconciliation,
+        pending_count,
+    )
+    authoritative_state = determine_run_state(
+        bool(authoritative_transactions),
+        pending_count,
+        authoritative_reconciliation,
+        authoritative_issues,
+    )
+    authoritative_all_issues = collect_ledger_issues(
+        authoritative_issues,
+        authoritative_reconciliation,
+        pending_count,
+    )
+    expected_exceptions = tuple({
+        "code": issue.code,
+        "blocking": str(issue.blocking).lower(),
+        "message": f"Issue: {issue.code}",
+        "source_file": _opaque_source(issue.source_file),
+        "source_location": _opaque_source(issue.source_location),
+    } for issue in authoritative_all_issues)
+    if tuple(exceptions) != expected_exceptions:
+        raise ValueError("pending derived output cross-artifact validation failed")
+    expected_reconciliation_artifacts = _reconciliation_artifacts(
+        authoritative_reconciliation,
+        authoritative_state,
+    )
+    if any(
+        artifact_path(relative).read_bytes() != payload
+        for relative, payload in expected_reconciliation_artifacts.items()
+    ):
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    parsed_reconciliation = _parsed_reconciliation_rows(reconciliation)
+    exception_issues = tuple(
+        Issue(row["code"], row["message"], row["blocking"] == "true")
+        for row in exceptions
+    )
+    exception_codes = {issue.code for issue in exception_issues}
+    blocking_exception_codes = {issue.code for issue in exception_issues if issue.blocking}
+    reconciliation_issue_codes = {
+        issue.code for row in parsed_reconciliation for issue in row.issues
+    }
+    if not reconciliation_issue_codes.issubset(exception_codes) or any(
+        code in _BLOCKING_CODES and code not in blocking_exception_codes
+        for code in reconciliation_issue_codes
+    ):
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    recomputed_state = determine_run_state(
+        bool(normalized), pending_count, parsed_reconciliation, exception_issues
+    )
+    if recomputed_state != authoritative_state:
+        raise ValueError("pending derived output cross-artifact validation failed")
+    expected_status_facts = {
+        "blocking_issue_count": sum(issue.blocking for issue in exception_issues),
+        "has_transactions": bool(normalized),
+        "pending_group_count": pending_count,
+        "reconciled_unit_count": sum(row.reconciled for row in parsed_reconciliation),
+        "state": recomputed_state.value,
+        "unit_count": len(parsed_reconciliation),
+    }
+    if any(status[field] != value for field, value in expected_status_facts.items()):
+        raise ValueError("pending derived output cross-artifact validation failed")
+
+    actual_summary = {
+        (row["account_label"], row["currency"]): (
+            int(row["period_count"]), int(row["reconciled_period_count"])
+        )
+        for row in summary
+    }
+    reconciliation_units = {
+        (row["account_label"], row["currency"]) for row in reconciliation
+    }
+    expected_summary = {
+        key: (
+            sum((row["account_label"], row["currency"]) == key for row in reconciliation),
+            sum(
+                (row["account_label"], row["currency"]) == key
+                and row["reconciled"] == "true"
+                for row in reconciliation
+            ),
+        )
+        for key in reconciliation_units
+    }
+    if actual_summary != expected_summary or any(
+        row["state"] != recomputed_state.value for row in summary
+    ):
+        raise ValueError("pending derived output cross-artifact validation failed")
+    report_path = artifact_path("outputs/reconciliation-report.md")
+    if not report_path.read_text(encoding="utf-8").startswith(f"Run state: {recomputed_state.value}\n"):
         raise ValueError("pending derived report is malformed")
 
 
@@ -584,7 +790,7 @@ def _install_output_bundle(ledger_root: Path, artifacts: Mapping[str, bytes]) ->
 def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = False) -> dict[str, object]:
     """Publish one complete deterministic ledger-local view, recovering an old view first."""
     recover_pending_output_bundle(ledger_root)
-    from .classification import apply_exact_rules, build_pending_groups, load_rules
+    from .classification import apply_exact_rules, load_rules
 
     transactions, canonical_load_issues = load_canonical_for_validation(ledger_root)
     valid_transactions, canonical_issues = admit_canonical_transactions(transactions)
@@ -610,13 +816,10 @@ def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = Fals
         "outputs/exceptions.csv": _csv_bytes(_EXCEPTION_FIELDS, exceptions),
     }
     artifacts.update(_reconciliation_artifacts(rows, state))
-    groups = build_pending_groups(classified_rows)
-    artifacts["work/pending-merchant-groups.csv"] = _csv_bytes(_PENDING_GROUP_FIELDS, ({
-            "group_id": group.group_id, "normalized_merchant": group.normalized_merchant, "direction": group.direction,
-            "currencies": "|".join(group.currencies), "account_ids": "|".join(group.account_ids),
-            "transaction_count": str(group.transaction_count), "totals_by_currency": "|".join(f"{currency}:{amount}" for currency, amount in group.totals_by_currency),
-            "date_start": group.date_start, "date_end": group.date_end, "confidence": group.confidence,
-        } for group in groups))
+    artifacts["work/pending-merchant-groups.csv"] = _csv_bytes(
+        _PENDING_GROUP_FIELDS,
+        _pending_group_rows(classified_rows),
+    )
     hashes = {relative: hashlib.sha256(payload).hexdigest() for relative, payload in sorted(artifacts.items())}
     manifest = resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json")
     if manifest.exists():
