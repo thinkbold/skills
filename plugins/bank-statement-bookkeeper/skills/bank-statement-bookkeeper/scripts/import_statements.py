@@ -20,6 +20,7 @@ from bookkeeper.importing import (
     recover_pending_correction,
 )
 from bookkeeper.ledger import load_ledger
+from bookkeeper.pdf_local import detect_pdf_capabilities, extract_pdf_pages, map_pdf_tables
 from bookkeeper.storage import (
     append_audit_event,
     atomic_write_csv,
@@ -27,6 +28,7 @@ from bookkeeper.storage import (
     mask_account_label,
     read_csv_rows,
     resolve_inside_ledger,
+    sha256_file,
 )
 
 
@@ -106,14 +108,12 @@ def _candidate_summary(candidate: AccountCandidate) -> dict[str, object]:
     }
 
 
-def _write_import(
+def _record_import(
     ledger_root: Path,
-    source: Path,
     source_identity: str,
-    mapping: CsvMapping,
-    account: AccountContext,
+    result: ImportResult,
+    event_type: str,
 ) -> dict[str, object]:
-    result = normalize_csv_statement(source, mapping, account, source_identity)
     if result.issues:
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
     manifest = _manifest(ledger_root)
@@ -134,11 +134,43 @@ def _write_import(
     })
     event_id = append_audit_event(
         ledger_root,
-        "csv_import_recorded",
+        event_type,
         {"source_hashes": hashes, "transaction_count": len(merged.transactions), "overlap_count": len(merged.duplicate_sources)},
-        dedupe_key=f"csv-import:{source_hash}",
+        dedupe_key=f"{event_type}:{source_hash}",
     )
     return {"status": "imported", "transaction_count": len(merged.transactions), "audit_event_id": event_id}
+
+
+def _write_import(
+    ledger_root: Path,
+    source: Path,
+    source_identity: str,
+    mapping: CsvMapping,
+    account: AccountContext,
+) -> dict[str, object]:
+    return _record_import(
+        ledger_root, source_identity, normalize_csv_statement(source, mapping, account, source_identity), "csv_import_recorded",
+    )
+
+
+def _write_pdf_import(
+    ledger_root: Path,
+    source: Path,
+    source_identity: str,
+    mapping: CsvMapping,
+    account: AccountContext,
+) -> dict[str, object]:
+    extraction = extract_pdf_pages(
+        source, resolve_inside_ledger(ledger_root, "work"), detect_pdf_capabilities(),
+    )
+    mapped = map_pdf_tables(extraction, mapping, account, source_file=source_identity)
+    result = ImportResult(
+        transactions=mapped.transactions,
+        issues=mapped.issues,
+        source_hashes={source_identity: sha256_file(source)},
+        staged_files=(extraction.staged_pdf,) if extraction.staged_pdf else (),
+    )
+    return _record_import(ledger_root, source_identity, result, "pdf_import_recorded")
 
 
 def _correct_row(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
@@ -165,6 +197,11 @@ def _parser() -> argparse.ArgumentParser:
     csv_import.add_argument("statement", type=Path)
     csv_import.add_argument("--mapping", required=True)
     csv_import.add_argument("--account", required=True)
+    pdf_import = commands.add_parser("pdf")
+    pdf_import.add_argument("ledger_dir", type=Path)
+    pdf_import.add_argument("statement", type=Path)
+    pdf_import.add_argument("--mapping", required=True)
+    pdf_import.add_argument("--account", required=True)
     correction = commands.add_parser("correct-row")
     correction.add_argument("ledger_dir", type=Path)
     correction.add_argument("transaction_id")
@@ -194,6 +231,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "csv":
             source, source_identity = _ledger_input(ledger_root, args.statement)
             output = _write_import(
+                ledger_root, source, source_identity, _mapping(_read_ledger_json(ledger_root, args.mapping)),
+                _account(_read_ledger_json(ledger_root, args.account)),
+            )
+        elif args.command == "pdf":
+            source, source_identity = _ledger_input(ledger_root, args.statement)
+            output = _write_pdf_import(
                 ledger_root, source, source_identity, _mapping(_read_ledger_json(ledger_root, args.mapping)),
                 _account(_read_ledger_json(ledger_root, args.account)),
             )
