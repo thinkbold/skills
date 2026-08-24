@@ -81,7 +81,8 @@ def normalize_merchant(value: str) -> str:
     return " ".join(tokens)
 
 
-def _direction(row: dict[str, str]) -> str:
+def transaction_direction(row: dict[str, str]) -> str:
+    """Return the production direction using exact decimal amount semantics."""
     if Decimal(row.get("outflow", "0") or "0") > 0:
         return "outflow"
     if Decimal(row.get("inflow", "0") or "0") > 0:
@@ -167,7 +168,7 @@ def build_pending_groups(transactions: tuple[dict[str, str], ...]) -> tuple[Merc
     for row in transactions:
         if row.get("classification_status", "unclassified") != "unclassified":
             continue
-        merchant, direction = _normalized(row), _direction(row)
+        merchant, direction = _normalized(row), transaction_direction(row)
         if merchant and direction:
             grouped.setdefault((merchant, direction), []).append(row)
     groups: list[MerchantGroup] = []
@@ -192,7 +193,7 @@ def build_pending_groups(transactions: tuple[dict[str, str], ...]) -> tuple[Merc
 
 
 def _matching_rules(row: dict[str, str], rules: list[dict[str, str]]) -> list[dict[str, str]]:
-    merchant, direction = _normalized(row), _direction(row)
+    merchant, direction = _normalized(row), transaction_direction(row)
     words = set(merchant.split())
     matching: list[dict[str, str]] = []
     for rule in rules:
@@ -413,7 +414,7 @@ def confirm_group(
     else:
         selected_ids = tuple(row["transaction_id"] for row in sorted(
             (row for row in transactions if row.get("classification_status", "unclassified") == "unclassified"
-             and _normalized(row) == merchant and _direction(row) == direction),
+             and _normalized(row) == merchant and transaction_direction(row) == direction),
             key=lambda row: (row.get("transaction_date", ""), row["transaction_id"]),
         ))
     if not selected_ids:
@@ -422,7 +423,7 @@ def confirm_group(
     if len(selected_ids) != len(set(selected_ids)) or any(transaction_id not in by_id for transaction_id in selected_ids):
         raise ValueError("group no longer matches its selected transactions")
     selected = [by_id[transaction_id] for transaction_id in selected_ids]
-    if any(row.get("classification_status", "unclassified") != "unclassified" or _normalized(row) != merchant or _direction(row) != direction for row in selected):
+    if any(row.get("classification_status", "unclassified") != "unclassified" or _normalized(row) != merchant or transaction_direction(row) != direction for row in selected):
         raise ValueError("group no longer matches its selected transactions")
     group_id = "merchant-" + hashlib.sha256((merchant + "\0" + direction + "\0" + "\0".join(selected_ids)).encode("utf-8")).hexdigest()[:16]
     operation_key = _operation_key("confirm", {
@@ -452,7 +453,7 @@ def confirm_group(
     event_payload = {
         "transaction_ids": list(selected_ids), "normalized_merchant_sha256": hashlib.sha256(merchant.encode()).hexdigest(),
         "direction": direction, "account_code": code, "account_name_sha256": hashlib.sha256(name.encode()).hexdigest(),
-        "apply_future": apply_future, "group_id": group_id,
+        "apply_future": apply_future, "group_id": group_id, "rule_id": rule["rule_id"] if rule else "",
     }
     event_id = uuid4().hex
     if rule is not None and rule["audit_event_id"] == "PENDING":
@@ -501,7 +502,7 @@ def correct_transactions(ledger_root: Path, transactions: tuple[dict[str, str], 
     if scope == "future_rule":
         accounts = {row.get("account_id", "") for row in selected}
         merchants = {_normalized(row) for row in selected}
-        directions = {_direction(row) for row in selected}
+        directions = {transaction_direction(row) for row in selected}
         if len(accounts) != 1 or len(merchants) != 1 or len(directions) != 1:
             raise ValueError("future_rule correction requires one merchant, direction, and account")
         old_ids = {row.get("rule_id", "") for row in selected if row.get("rule_id")}
@@ -524,11 +525,11 @@ def correct_transactions(ledger_root: Path, transactions: tuple[dict[str, str], 
     for source in transactions:
         item = dict(source)
         if item.get("transaction_id") in requested_ids:
-            item.update({"normalized_merchant": _normalized(item), "classification_status": "classified", "account_code": code, "account_name": name, "rule_id": rule_id if scope == "future_rule" else item.get("rule_id", ""), "review_note": ""})
+            item.update({"normalized_merchant": _normalized(item), "classification_status": "classified", "account_code": code, "account_name": name, "rule_id": rule_id, "review_note": ""})
         output.append(item)
     event_payload = {
         "transaction_ids": list(requested_ids), "account_code": code,
-        "account_name_sha256": hashlib.sha256(name.encode()).hexdigest(), "scope": scope,
+        "account_name_sha256": hashlib.sha256(name.encode()).hexdigest(), "rule_id": rule_id, "scope": scope,
     }
     transactions_path = resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH)
     rules_path = resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH)
