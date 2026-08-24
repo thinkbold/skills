@@ -18,7 +18,7 @@ from bookkeeper.classification import save_transactions
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, BALANCE_FIELDS
 from bookkeeper.storage import atomic_write_csv
 from bookkeeper.reconciliation import reconcile_account_period
-from bookkeeper.validation import collect_ledger_issues, determine_run_state, finalize_outputs
+from bookkeeper.validation import _masked_message, collect_ledger_issues, determine_run_state, finalize_outputs
 
 
 class ValidationTests(unittest.TestCase):
@@ -186,10 +186,46 @@ class ValidationTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             ledger = Path(temp) / "ledger"
             initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
-            finalize_outputs(ledger, has_transactions=False, pending_group_count=0, reconciliation_rows=(), issues=(Issue("PDF_PAGE_EMPTY", "checking-001 failed", True, "checking-001.pdf", "checking-001:2"),), account_labels={"checking-001": "123456789012"})
+            finalize_outputs(
+                ledger,
+                has_transactions=False,
+                pending_group_count=0,
+                reconciliation_rows=(),
+                issues=(Issue(
+                    "PDF_PAGE_EMPTY",
+                    "checking-001 checking savings-002 123456789012 empty-label-account failed",
+                    True,
+                ),),
+                account_labels={
+                    "checking": "checking-001",
+                    "savings-002": "123456789012",
+                    "empty-label-account": "",
+                },
+            )
             text = (ledger / "outputs" / "exceptions.csv").read_text(encoding="utf-8")
-            self.assertNotIn("checking-001", text)
-            self.assertNotIn("123456789012", text)
+            for secret in ("checking-001", "checking", "savings-002", "123456789012", "empty-label-account"):
+                self.assertNotIn(secret, text)
+            for token in (
+                "account-490153303548", "account-7f98506ac726", "account-03a60ad81238",
+                "account-2a33349e7e60", "account-7bc48469cced",
+            ):
+                self.assertIn(token, text)
+
+    def test_masked_message_replaces_keys_and_values_without_overlap_or_empty_leaks(self) -> None:
+        """Catches raw labels, partial overlap replacement, or empty-label expansion."""
+        cases = (
+            ("123456789012 failed", {"checking-001": "123456789012"}, "account-2a33349e7e60 failed"),
+            ("checking-001 failed", {"checking-001": "123456789012"}, "account-490153303548 failed"),
+            (
+                "checking-001 checking failed",
+                {"checking": "checking-001"},
+                "account-490153303548 account-7f98506ac726 failed",
+            ),
+            ("empty-label-account failed", {"empty-label-account": ""}, "account-7bc48469cced failed"),
+        )
+        for message, labels, expected in cases:
+            with self.subTest(message=message, labels=labels):
+                self.assertEqual(expected, _masked_message(message, labels))
 
     def test_exception_sources_are_opaque(self) -> None:
         """Catches caller supplied account, filename, or location text escaping exceptions.csv."""

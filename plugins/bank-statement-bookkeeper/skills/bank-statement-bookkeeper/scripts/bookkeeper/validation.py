@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import csv
+import re
 from pathlib import Path
 from typing import Iterable, Mapping
 from datetime import date
@@ -144,10 +145,20 @@ def collect_ledger_issues(
 def _masked_message(message: str, account_labels: Mapping[str, str] | None) -> str:
     if not account_labels:
         return ""
-    masked = message
-    for account_id, _label in sorted(account_labels.items(), key=lambda item: -len(item[0])):
-        masked = masked.replace(account_id, f"account-{hashlib.sha256(account_id.encode('utf-8')).hexdigest()[:12]}")
-    return masked
+    sensitive_values = {
+        value
+        for account_id, label in account_labels.items()
+        for value in (account_id, label)
+        if value
+    }
+    if not sensitive_values:
+        return message
+    ordered_values = sorted(sensitive_values, key=lambda value: (-len(value), value))
+    pattern = re.compile("|".join(re.escape(value) for value in ordered_values))
+    return pattern.sub(
+        lambda match: f"account-{hashlib.sha256(match.group().encode('utf-8')).hexdigest()[:12]}",
+        message,
+    )
 
 
 def _opaque_source(value: str) -> str:
