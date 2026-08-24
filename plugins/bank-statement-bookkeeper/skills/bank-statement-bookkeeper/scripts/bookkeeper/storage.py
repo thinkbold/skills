@@ -24,6 +24,7 @@ _SENSITIVE_AUDIT_KEYS = frozenset({
     "raw_description",
     "description",
 })
+_NON_DEDUPLICABLE_AUDIT_PREFIXES = ("external_processing_consent_",)
 
 
 def resolve_inside_ledger(root: Path, relative: str | Path) -> Path:
@@ -145,6 +146,8 @@ def append_audit_event(
     sensitive_key = _find_sensitive_key(payload)
     if sensitive_key is not None:
         raise ValueError(f"sensitive audit key: {sensitive_key}")
+    if dedupe_key is not None and event_type.startswith(_NON_DEDUPLICABLE_AUDIT_PREFIXES):
+        raise ValueError("dedupe_key is not permitted for external processing consent events")
 
     existing_events = read_audit_events(ledger_root)
     if dedupe_key is not None:

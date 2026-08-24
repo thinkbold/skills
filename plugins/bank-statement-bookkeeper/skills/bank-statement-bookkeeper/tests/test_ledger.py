@@ -97,6 +97,20 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(deduped, repeated)
             self.assertEqual(4, len(read_audit_events(root)))
 
+    def test_external_processing_consent_decisions_reject_deduplication(self) -> None:
+        """Catches a consent decision being silently coalesced by a dedupe key."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp) / "ledger"
+            initialize_ledger(root, "acme", "Acme", "CAD")
+
+            with self.assertRaisesRegex(ValueError, "dedupe_key"):
+                append_audit_event(
+                    root,
+                    "external_processing_consent_decision",
+                    {"operation_id": "op-1", "authorized": True},
+                    dedupe_key="op-1",
+                )
+
     def test_nested_sensitive_audit_key_and_other_ledger_are_rejected(self) -> None:
         """Catches nested private data and accidental reuse of another ledger root."""
         with TemporaryDirectory() as temp:
