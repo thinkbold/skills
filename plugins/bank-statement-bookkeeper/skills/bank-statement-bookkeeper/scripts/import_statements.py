@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -90,12 +92,167 @@ def _account(payload: dict[str, object]) -> AccountContext:
 def _manifest(ledger_root: Path) -> dict[str, object]:
     path = resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json")
     if not path.exists():
-        return {"source_hashes": {}, "transaction_count": 0}
+        return {"source_contributions": {}, "source_hashes": {}, "source_order": [], "transaction_count": 0}
     with path.open("r", encoding="utf-8") as handle:
         loaded = json.load(handle)
     if not isinstance(loaded, dict) or not isinstance(loaded.get("source_hashes", {}), dict):
         raise ValueError("import manifest is invalid")
     return loaded
+
+
+_CONTRIBUTION_DIRECTORY = Path("work") / "import-contributions"
+_UNCLASSIFIED_BLANK_FIELDS = (
+    "normalized_merchant", "account_code", "account_name", "rule_id", "review_note",
+)
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _contribution_relative_path(source_identity: str, source_hash: str) -> Path:
+    identity_hash = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
+    return _CONTRIBUTION_DIRECTORY / f"{identity_hash}-{source_hash}.csv"
+
+
+def _validate_contribution_rows(source_identity: str, rows: tuple[dict[str, str], ...]) -> None:
+    for row in rows:
+        if set(row) != set(CANONICAL_TRANSACTION_FIELDS):
+            raise ValueError("import contribution row has invalid fields")
+        if row["source_file"] != source_identity:
+            raise ValueError("import contribution source identity is invalid")
+        locations = [location for location in row["source_locations"].split("|") if location]
+        if not locations or not all(location.startswith(f"{source_identity}:") for location in locations):
+            raise ValueError("import contribution provenance is invalid")
+        if row["classification_status"] != "unclassified" or any(row[field] for field in _UNCLASSIFIED_BLANK_FIELDS):
+            raise ValueError("import contribution must be unclassified")
+
+
+def _existing_contribution_path(ledger_root: Path, relative: Path) -> Path:
+    if relative.parent != _CONTRIBUTION_DIRECTORY or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("import contribution path is invalid")
+    current = ledger_root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError as error:
+            raise ValueError("import contribution snapshot is missing") from error
+        if stat.S_ISLNK(mode):
+            raise ValueError("import contribution path contains a symlink")
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(mode):
+            raise ValueError("import contribution ancestor is invalid")
+        if index == len(relative.parts) - 1 and not stat.S_ISREG(mode):
+            raise ValueError("import contribution snapshot is invalid")
+    return current
+
+
+def _read_contribution_rows(path: Path, source_identity: str) -> tuple[dict[str, str], ...]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != CANONICAL_TRANSACTION_FIELDS:
+            raise ValueError("import contribution header is invalid")
+        rows = tuple(dict(row) for row in reader)
+    if any(any(value is None for value in row.values()) for row in rows):
+        raise ValueError("import contribution row is invalid")
+    _validate_contribution_rows(source_identity, rows)
+    return rows
+
+
+def _current_contributions(
+    ledger_root: Path,
+    manifest: dict[str, object],
+) -> tuple[list[str], dict[str, ImportResult], dict[str, dict[str, str]]]:
+    hashes = manifest.get("source_hashes", {})
+    if not isinstance(hashes, dict) or not all(isinstance(source, str) and _is_sha256(value) for source, value in hashes.items()):
+        raise ValueError("import manifest source hashes are invalid")
+    entries = manifest.get("source_contributions", {})
+    order = manifest.get("source_order", [])
+    if not hashes:
+        if entries not in ({}, None) or order not in ([], None):
+            raise ValueError("import manifest contributions are invalid")
+        return [], {}, {}
+    if not isinstance(entries, dict) or not isinstance(order, list):
+        raise ValueError("import manifest lacks trustworthy contribution snapshots")
+    if not all(isinstance(source, str) for source in order) or len(order) != len(set(order)):
+        raise ValueError("import manifest source order is invalid")
+    if set(order) != set(hashes) or set(entries) != set(hashes):
+        raise ValueError("import manifest contribution sources are inconsistent")
+    results: dict[str, ImportResult] = {}
+    validated_entries: dict[str, dict[str, str]] = {}
+    for source_identity in order:
+        source_hash = str(hashes[source_identity])
+        entry = entries[source_identity]
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            raise ValueError("import manifest contribution entry is invalid")
+        relative = _contribution_relative_path(source_identity, source_hash)
+        if entry.get("path") != relative.as_posix() or not _is_sha256(entry.get("sha256")):
+            raise ValueError("import manifest contribution binding is invalid")
+        path = _existing_contribution_path(ledger_root, relative)
+        if sha256_file(path) != entry["sha256"]:
+            raise ValueError("import contribution snapshot hash mismatch")
+        rows = _read_contribution_rows(path, source_identity)
+        results[source_identity] = ImportResult(transactions=rows, source_hashes={source_identity: source_hash})
+        validated_entries[source_identity] = {"path": relative.as_posix(), "sha256": str(entry["sha256"])}
+    return list(order), results, validated_entries
+
+
+def _snapshot_bytes(rows: tuple[dict[str, str], ...]) -> bytes:
+    output = StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=CANONICAL_TRANSACTION_FIELDS, extrasaction="raise")
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue().encode("utf-8")
+
+
+def _write_contribution_snapshot(
+    ledger_root: Path,
+    source_identity: str,
+    source_hash: str,
+    rows: tuple[dict[str, str], ...],
+) -> dict[str, str]:
+    _validate_contribution_rows(source_identity, rows)
+    expected_hash = hashlib.sha256(_snapshot_bytes(rows)).hexdigest()
+    directory = ledger_root / _CONTRIBUTION_DIRECTORY
+    try:
+        mode = os.lstat(directory).st_mode
+    except FileNotFoundError:
+        directory.mkdir()
+    else:
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ValueError("import contribution directory is invalid")
+    relative = _contribution_relative_path(source_identity, source_hash)
+    path = ledger_root / relative
+    if path.exists():
+        existing = _existing_contribution_path(ledger_root, relative)
+        if sha256_file(existing) != expected_hash:
+            raise ValueError("existing import contribution snapshot conflicts with normalized rows")
+    else:
+        atomic_write_csv(path, CANONICAL_TRANSACTION_FIELDS, rows)
+        if sha256_file(path) != expected_hash:
+            raise ValueError("import contribution snapshot write failed")
+    return {"path": relative.as_posix(), "sha256": expected_hash}
+
+
+def _prune_unreferenced_contributions(
+    ledger_root: Path,
+    contribution_entries: dict[str, dict[str, str]],
+) -> None:
+    directory = ledger_root / _CONTRIBUTION_DIRECTORY
+    if not directory.exists():
+        return
+    mode = os.lstat(directory).st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise ValueError("import contribution directory is invalid")
+    referenced = {Path(entry["path"]).name for entry in contribution_entries.values()}
+    for path in directory.iterdir():
+        parts = path.stem.split("-")
+        managed_snapshot = (
+            path.suffix == ".csv" and len(parts) == 2
+            and all(_is_sha256(part) for part in parts)
+        )
+        if managed_snapshot and path.name not in referenced:
+            path.unlink()
 
 
 def _ledger_input(ledger_root: Path, requested: Path) -> tuple[Path, str]:
@@ -171,41 +328,43 @@ def _record_import(
     result: ImportResult,
     event_type: str,
 ) -> dict[str, object]:
+    manifest = _manifest(ledger_root)
+    source_order, contributions, contribution_entries = _current_contributions(ledger_root, manifest)
     replace_active_issues(ledger_root, "import", {"source": source_identity}, result.issues)
     if result.issues:
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
-    manifest = _manifest(ledger_root)
     previous_hashes = dict(manifest.get("source_hashes", {}))
+    if set(result.source_hashes) != {source_identity}:
+        raise ValueError("import result did not bind exactly one logical source")
     source_hash = result.source_hashes[source_identity]
+    if not _is_sha256(source_hash):
+        raise ValueError("import result source hash is invalid")
     canonical_path = resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv")
     existing = tuple(read_csv_rows(canonical_path)) if canonical_path.exists() else ()
     if previous_hashes.get(source_identity) == source_hash:
         merged = ImportResult(transactions=existing, source_hashes=previous_hashes)
+        hashes = previous_hashes
     else:
-        retained_rows = []
-        source_location_prefix = f"{source_identity}:"
-        for source in existing:
-            if source["source_file"] == source_identity:
-                continue
-            row = dict(source)
-            locations = [
-                location
-                for location in row["source_locations"].split("|")
-                if location and not location.startswith(source_location_prefix)
-            ]
-            if not locations:
-                raise ValueError("retained transaction lost all source provenance")
-            row["source_locations"] = "|".join(locations)
-            retained_rows.append(row)
-        retained = tuple(retained_rows)
-        merged = merge_import_results((ImportResult(transactions=retained, source_hashes=previous_hashes), result))
+        rows = tuple(dict(row) for row in result.transactions)
+        contribution_entries[source_identity] = _write_contribution_snapshot(
+            ledger_root, source_identity, source_hash, rows,
+        )
+        contributions[source_identity] = ImportResult(
+            transactions=rows, source_hashes={source_identity: source_hash},
+        )
+        if source_identity not in source_order:
+            source_order.append(source_identity)
+        merged = merge_import_results(contributions[source] for source in source_order)
+        hashes = {**previous_hashes, **result.source_hashes}
     classified = apply_exact_rules(merged.transactions, load_rules(ledger_root))
     atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, classified.transactions)
-    hashes = {**previous_hashes, **result.source_hashes}
     atomic_write_json(resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json"), {
+        "source_contributions": contribution_entries,
         "source_hashes": hashes,
+        "source_order": source_order,
         "transaction_count": len(merged.transactions),
     })
+    _prune_unreferenced_contributions(ledger_root, contribution_entries)
     event_id = append_audit_event(
         ledger_root,
         event_type,
@@ -296,15 +455,18 @@ def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, o
     selected_root = Path(os.path.abspath(os.fspath(args.ledger_dir)))
     result_path = _ledger_external_result(ledger_root, selected_root, args.result)
     result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, result_path)
-    replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, result.issues)
     if result.issues:
+        _current_contributions(ledger_root, _manifest(ledger_root))
+        replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, result.issues)
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
     if len(result.source_hashes) != 1:
         raise ValueError("external result did not identify one logical source")
     source_identity = next(iter(result.source_hashes))
-    return _record_import(
+    output = _record_import(
         ledger_root, source_identity, result, "external_result_import_recorded",
     )
+    replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, ())
+    return output
 
 
 def _parser() -> argparse.ArgumentParser:
