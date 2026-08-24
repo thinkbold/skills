@@ -8,6 +8,7 @@ import hashlib
 from io import StringIO
 import json
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -450,6 +451,55 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(first_bytes, self._ledger_bytes())
         self.assertEqual(first_rows, read_csv_rows(self.ledger / "work" / "normalized-transactions.csv"))
         self.assertEqual(first_events, read_audit_events(self.ledger))
+
+    def test_external_inflow_with_decimal_zero_outflow_replays_its_selected_classification(self) -> None:
+        """Catches direction replay treating decimal zero as an outflow after an unrelated import."""
+        consent_id = self._authorize()
+        returned = self._write_result("external-inflow.csv", {
+            "inflow": "20.00", "outflow": "0.00", "running_balance": "1020.00",
+        })
+        first_code, _ = self._run_external_result(returned, consent_id)
+        self.assertEqual(0, first_code)
+        classify = str(SKILL_ROOT / "scripts" / "classify_transactions.py")
+        pending = subprocess.run(
+            [sys.executable, classify, "pending", str(self.ledger)],
+            check=True, capture_output=True, text=True,
+        )
+        group = json.loads(pending.stdout)["groups"][0]
+        self.assertEqual("inflow", group["direction"])
+        subprocess.run([
+            sys.executable, classify, "confirm", str(self.ledger), group["group_id"],
+            "--account-code", "", "--account-name", "Selected Inflow", "--actor", "user",
+        ], check=True, capture_output=True, text=True)
+        historical = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")[0]
+        second_hash = "b" * 64
+        second_proposal = create_external_proposal(
+            provider=PROVIDER, source_hash=second_hash, pages=(2,), fields=("date", "description", "amount"),
+            sensitive_data=("descriptions", "amounts"), retention_risk="Unknown.", training_risk="Unknown.",
+            regional_risk="Unknown.", redactions=("mask account header",), manual_alternative="Enter locally.",
+        )
+        second_id = self._authorize_proposal(second_proposal)
+        unrelated = self._write_result("external-unrelated.csv", {
+            "transaction_date": "2026-02-05", "posting_date": "2026-02-05",
+            "raw_description": "Unrelated merchant", "inflow": "0.00", "outflow": "12.00",
+            "running_balance": "1008.00", "reference": "UNRELATED-1",
+        })
+        output = StringIO()
+
+        with redirect_stdout(output):
+            second_code = import_statements.main([
+                "external-result", str(self.ledger), str(unrelated), "--consent-id", second_id,
+                "--provider", PROVIDER, "--source-hash", second_hash,
+            ])
+
+        self.assertEqual(0, second_code, output.getvalue())
+        rebuilt = next(
+            row for row in read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+            if row["transaction_id"] == historical["transaction_id"]
+        )
+        self.assertEqual(("classified", "Selected Inflow", ""), (
+            rebuilt["classification_status"], rebuilt["account_name"], rebuilt["rule_id"],
+        ))
 
     def test_cli_changed_external_bytes_replace_one_operation_without_stale_rows(self) -> None:
         """Catches changed returned bytes appending beside the prior contribution for one operation."""

@@ -13,7 +13,13 @@ import stat
 import sys
 
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult
-from bookkeeper.classification import apply_exact_rules, load_rules, load_transactions, normalize_merchant
+from bookkeeper.classification import (
+    apply_exact_rules,
+    load_rules,
+    load_transactions,
+    normalize_merchant,
+    transaction_direction,
+)
 from bookkeeper.consent import (
     admit_external_result,
     proposal_from_dict,
@@ -314,11 +320,15 @@ def _decision_overlays(
     """Return only durable audit-backed user decisions for unchanged transaction IDs."""
     events = read_audit_events(ledger_root)
     event_ids: set[str] = set()
-    for event in events:
+    event_indexes: dict[str, int] = {}
+    events_by_id: dict[str, dict[str, object]] = {}
+    for index, event in enumerate(events):
         event_id = event.get("event_id")
         if not isinstance(event_id, str) or not event_id or event_id in event_ids:
             raise ValueError("audit event IDs are invalid")
         event_ids.add(event_id)
+        event_indexes[event_id] = index
+        events_by_id[event_id] = event
     records = _correction_records(ledger_root)
     manual_events = {
         str(event["event_id"]): event
@@ -327,11 +337,21 @@ def _decision_overlays(
     if set(records) != set(manual_events):
         raise ValueError("manual correction records do not match their audit events")
     current_by_id = {row["transaction_id"]: row for row in current}
+    rules = load_rules(ledger_root)
+    rules_by_id = {rule["rule_id"]: rule for rule in rules}
+    if len(rules_by_id) != len(rules):
+        raise ValueError("merchant rule IDs are invalid")
+    deleted_rule_indexes: dict[str, int] = {}
     overlays: dict[str, dict[str, tuple[int, str]]] = {}
     latest_classification: dict[str, tuple[int, dict[str, object]]] = {}
     for index, event in enumerate(events):
         event_type = event.get("event_type")
         event_id = str(event["event_id"])
+        if event_type == "merchant_rule_deleted":
+            payload = event.get("payload")
+            if not isinstance(payload, dict) or not isinstance(payload.get("rule_id"), str) or not payload["rule_id"]:
+                raise ValueError("rule deletion audit payload is invalid")
+            deleted_rule_indexes[payload["rule_id"]] = index
         if event_type == "manual_correction_recorded":
             record = records[event_id]
             payload = event.get("payload")
@@ -382,17 +402,60 @@ def _decision_overlays(
         ):
             raise ValueError("classification decision does not match current canonical row")
         merchant = normalize_merchant(row["raw_description"])
-        if event.get("event_type") == "merchant_group_confirmed":
+        event_type = event.get("event_type")
+        if event_type == "merchant_group_confirmed":
+            if not isinstance(payload.get("apply_future"), bool):
+                raise ValueError("classification decision future scope is invalid")
             merchant_hash = payload.get("normalized_merchant_sha256")
-            direction = "outflow" if row["outflow"] not in {"", "0"} else "inflow"
+            direction = transaction_direction(row)
             if not _is_sha256(merchant_hash) or _hash_text(merchant) != merchant_hash or payload.get("direction") != direction:
                 raise ValueError("classification decision merchant binding is invalid")
+        rule_id = payload.get("rule_id")
+        if rule_id is None:
+            if (
+                (event_type == "merchant_group_confirmed" and payload.get("apply_future") is False)
+                or event_type == "merchant_classification_corrected"
+            ):
+                rule_id = ""
+            else:
+                raise ValueError("classification decision rule binding is unavailable")
+        if not isinstance(rule_id, str):
+            raise ValueError("classification decision rule binding is invalid")
+        future_rule = (
+            (event_type == "merchant_group_confirmed" and payload.get("apply_future") is True)
+            or event_type == "merchant_rule_replaced"
+        )
+        if future_rule != bool(rule_id):
+            raise ValueError("classification decision rule binding is invalid")
+        if not rule_id and event_type != "merchant_classification_corrected" and row["rule_id"]:
+            raise ValueError("classification decision does not match current canonical rule")
+        if rule_id:
+            if row["rule_id"] != rule_id:
+                raise ValueError("classification decision does not match current canonical rule")
+            rule = rules_by_id.get(rule_id)
+            if rule is not None:
+                rule_event = events_by_id.get(rule["audit_event_id"])
+                rule_payload = rule_event.get("payload") if rule_event is not None else None
+                if (
+                    rule["account_code"] != account_code
+                    or _hash_text(rule["account_name"]) != account_name_hash
+                    or rule_event is None
+                    or rule_event.get("event_type") not in {"merchant_group_confirmed", "merchant_rule_replaced"}
+                    or not isinstance(rule_payload, dict)
+                    or rule_payload.get("account_code") != rule["account_code"]
+                    or rule_payload.get("account_name_sha256") != _hash_text(rule["account_name"])
+                    or rule_payload.get("rule_id", rule_id) != rule_id
+                    or event_indexes[rule["audit_event_id"]] > index
+                ):
+                    raise ValueError("classification decision rule linkage is invalid")
+            elif deleted_rule_indexes.get(rule_id, -1) <= index:
+                raise ValueError("classification decision deleted rule linkage is invalid")
         transaction_writes = overlays.setdefault(transaction_id, {})
         for field, value in {
             "classification_status": "classified",
             "account_code": account_code,
             "account_name": row["account_name"],
-            "rule_id": "",
+            "rule_id": rule_id,
             "review_note": "",
         }.items():
             if field not in transaction_writes or transaction_writes[field][0] < index:
@@ -520,12 +583,12 @@ def _record_import(
         )
         if source_identity not in source_order:
             source_order.append(source_identity)
-        merged = merge_import_results(
-            ImportResult(
-                transactions=_apply_decision_overlays(contributions[source].transactions, overlays),
-                source_hashes=contributions[source].source_hashes,
-            )
-            for source in source_order
+        merged = merge_import_results(contributions[source] for source in source_order)
+        merged = ImportResult(
+            transactions=_apply_decision_overlays(merged.transactions, overlays),
+            source_hashes=merged.source_hashes,
+            issues=merged.issues,
+            duplicate_sources=merged.duplicate_sources,
         )
         hashes = {**previous_hashes, **result.source_hashes}
     classified = apply_exact_rules(merged.transactions, load_rules(ledger_root))

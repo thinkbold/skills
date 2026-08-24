@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
-from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext
+from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, MERCHANT_RULE_FIELDS, AccountContext
 from bookkeeper.ledger import initialize_ledger
 from bookkeeper.storage import atomic_write_csv, read_audit_events, read_csv_rows
 from bookkeeper.importing import (
@@ -54,6 +54,9 @@ class ImportingTests(unittest.TestCase):
             sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"), "csv", str(ledger), source,
             "--mapping", "work/checking-map.json", "--account", "work/checking-account.json",
         ]
+
+    def _classification_command(self, *arguments: str) -> list[str]:
+        return [sys.executable, str(SKILL_ROOT / "scripts" / "classify_transactions.py"), *arguments]
 
     def _ledger_bytes(self, ledger: Path) -> dict[str, bytes]:
         return {
@@ -209,6 +212,161 @@ class ImportingTests(unittest.TestCase):
             )
             self.assertEqual("2026-01-07", row_after_rebuild["posting_date"])
             self.assertEqual(correction_event_id, row_after_rebuild["review_note"])
+
+    def test_signature_correction_preserves_one_overlap_row_and_all_source_locations(self) -> None:
+        """Catches replaying a signature correction before overlap removal and splitting one transaction."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            header = "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            overlap = "2026-01-05,2026-01-05,OVERLAP MERCHANT,10.00,,990.00,OVERLAP-1\n"
+            for name in ("a.csv", "b.csv"):
+                (ledger / "inputs" / name).write_text(header + overlap, encoding="utf-8")
+                subprocess.run(self._csv_command(ledger, f"inputs/{name}"), check=True, capture_output=True, text=True)
+            before = read_csv_rows(ledger / "work" / "normalized-transactions.csv")
+            self.assertEqual(1, len(before))
+            transaction_id = before[0]["transaction_id"]
+            correction = subprocess.run([
+                sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"), "correct-row", str(ledger),
+                transaction_id, "--field", "posting_date", "--value", "2026-01-07",
+                "--reason", "Confirmed corrected posting date", "--actor", "user",
+            ], check=True, capture_output=True, text=True)
+            (ledger / "inputs" / "c.csv").write_text(
+                header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,978.00,C-1\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(self._csv_command(ledger, "inputs/c.csv"), check=True, capture_output=True, text=True)
+
+            overlap_rows = [
+                row for row in read_csv_rows(ledger / "work" / "normalized-transactions.csv")
+                if row["raw_description"] == "OVERLAP MERCHANT"
+            ]
+            self.assertEqual(1, len(overlap_rows))
+            self.assertEqual(transaction_id, overlap_rows[0]["transaction_id"])
+            self.assertEqual("2026-01-07", overlap_rows[0]["posting_date"])
+            self.assertEqual(json.loads(correction.stdout)["audit_event_id"], overlap_rows[0]["review_note"])
+            self.assertEqual(
+                {"inputs/a.csv:2", "inputs/b.csv:2"},
+                set(overlap_rows[0]["source_locations"].split("|")),
+            )
+
+    def test_apply_future_confirmation_preserves_historical_rule_link_after_rebuild(self) -> None:
+        """Catches an unrelated import blanking the rule created by an apply-future confirmation."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            header = "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            (ledger / "inputs" / "a.csv").write_text(
+                header + "2026-01-05,2026-01-05,FUTURE MERCHANT,10.00,,990.00,A-1\n",
+                encoding="utf-8",
+            )
+            subprocess.run(self._csv_command(ledger, "inputs/a.csv"), check=True, capture_output=True, text=True)
+            pending = subprocess.run(
+                self._classification_command("pending", str(ledger)), check=True, capture_output=True, text=True,
+            )
+            group_id = json.loads(pending.stdout)["groups"][0]["group_id"]
+            subprocess.run(self._classification_command(
+                "confirm", str(ledger), group_id, "--account-code", "", "--account-name", "Durable Future",
+                "--apply-future", "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            historical = read_csv_rows(ledger / "work" / "normalized-transactions.csv")[0]
+            historical_rule_id = historical["rule_id"]
+            subprocess.run(self._classification_command(
+                "deactivate-rule", str(ledger), historical_rule_id, "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            (ledger / "inputs" / "b.csv").write_text(
+                header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,978.00,B-1\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(self._csv_command(ledger, "inputs/b.csv"), check=True, capture_output=True, text=True)
+
+            rebuilt = next(
+                row for row in read_csv_rows(ledger / "work" / "normalized-transactions.csv")
+                if row["transaction_id"] == historical["transaction_id"]
+            )
+            self.assertEqual(("classified", "Durable Future", historical_rule_id), (
+                rebuilt["classification_status"], rebuilt["account_name"], rebuilt["rule_id"],
+            ))
+
+    def test_future_rule_correction_preserves_deleted_historical_rule_link_after_rebuild(self) -> None:
+        """Catches replay losing the audit-bound replacement rule after that rule is deliberately deleted."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            header = "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            (ledger / "inputs" / "a.csv").write_text(
+                header + "2026-01-05,2026-01-05,REPLACED MERCHANT,10.00,,990.00,A-1\n",
+                encoding="utf-8",
+            )
+            subprocess.run(self._csv_command(ledger, "inputs/a.csv"), check=True, capture_output=True, text=True)
+            pending = subprocess.run(
+                self._classification_command("pending", str(ledger)), check=True, capture_output=True, text=True,
+            )
+            group_id = json.loads(pending.stdout)["groups"][0]["group_id"]
+            subprocess.run(self._classification_command(
+                "confirm", str(ledger), group_id, "--account-code", "", "--account-name", "Initial",
+                "--apply-future", "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            selected = read_csv_rows(ledger / "work" / "normalized-transactions.csv")[0]
+            subprocess.run(self._classification_command(
+                "correct", str(ledger), "--transaction-id", selected["transaction_id"],
+                "--account-code", "", "--account-name", "Durable Replacement",
+                "--scope", "future_rule", "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            historical = read_csv_rows(ledger / "work" / "normalized-transactions.csv")[0]
+            historical_rule_id = historical["rule_id"]
+            subprocess.run(self._classification_command(
+                "delete-rule", str(ledger), historical_rule_id, "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            self.assertNotIn(
+                historical_rule_id,
+                {rule["rule_id"] for rule in read_csv_rows(ledger / "merchant-rules.csv")},
+            )
+            (ledger / "inputs" / "b.csv").write_text(
+                header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,978.00,B-1\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(self._csv_command(ledger, "inputs/b.csv"), check=True, capture_output=True, text=True)
+
+            rebuilt = next(
+                row for row in read_csv_rows(ledger / "work" / "normalized-transactions.csv")
+                if row["transaction_id"] == historical["transaction_id"]
+            )
+            self.assertEqual(("classified", "Durable Replacement", historical_rule_id), (
+                rebuilt["classification_status"], rebuilt["account_name"], rebuilt["rule_id"],
+            ))
+
+    def test_selected_correction_deliberately_clears_an_existing_rule_link(self) -> None:
+        """Catches selected-only correction retaining a rule that authorizes future classifications."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            (ledger / "inputs" / "a.csv").write_text(
+                "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+                "2026-01-05,2026-01-05,SELECTED MERCHANT,10.00,,990.00,A-1\n",
+                encoding="utf-8",
+            )
+            subprocess.run(self._csv_command(ledger, "inputs/a.csv"), check=True, capture_output=True, text=True)
+            pending = subprocess.run(
+                self._classification_command("pending", str(ledger)), check=True, capture_output=True, text=True,
+            )
+            group_id = json.loads(pending.stdout)["groups"][0]["group_id"]
+            subprocess.run(self._classification_command(
+                "confirm", str(ledger), group_id, "--account-code", "", "--account-name", "Initial",
+                "--apply-future", "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            selected = read_csv_rows(ledger / "work" / "normalized-transactions.csv")[0]
+            self.assertNotEqual("", selected["rule_id"])
+
+            subprocess.run(self._classification_command(
+                "correct", str(ledger), "--transaction-id", selected["transaction_id"],
+                "--account-code", "", "--account-name", "One Time Override",
+                "--scope", "selected", "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+
+            corrected = read_csv_rows(ledger / "work" / "normalized-transactions.csv")[0]
+            self.assertEqual(("classified", "One Time Override", ""), (
+                corrected["classification_status"], corrected["account_name"], corrected["rule_id"],
+            ))
 
     def test_unrelated_import_preserves_a_selected_only_classification_correction(self) -> None:
         """Catches rebuilding a selected classification from rules when the user chose no future rule."""
@@ -380,6 +538,45 @@ class ImportingTests(unittest.TestCase):
 
             rejected = subprocess.run(
                 self._csv_command(ledger, "inputs/second.csv"), capture_output=True, text=True,
+            )
+
+            self.assertEqual(3, rejected.returncode)
+            self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+            self.assertEqual(expected, self._ledger_bytes(ledger))
+
+    def test_unrelated_import_fails_closed_on_a_rule_linked_to_an_unrelated_audit_event(self) -> None:
+        """Catches accepting a rule whose audit ID exists but did not authorize that rule."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            header = "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            (ledger / "inputs" / "a.csv").write_text(
+                header + "2026-01-05,2026-01-05,LINKED MERCHANT,10.00,,990.00,A-1\n",
+                encoding="utf-8",
+            )
+            subprocess.run(self._csv_command(ledger, "inputs/a.csv"), check=True, capture_output=True, text=True)
+            pending = subprocess.run(
+                self._classification_command("pending", str(ledger)), check=True, capture_output=True, text=True,
+            )
+            group_id = json.loads(pending.stdout)["groups"][0]["group_id"]
+            subprocess.run(self._classification_command(
+                "confirm", str(ledger), group_id, "--account-code", "", "--account-name", "Linked Category",
+                "--apply-future", "--actor", "user",
+            ), check=True, capture_output=True, text=True)
+            rules_path = ledger / "merchant-rules.csv"
+            rule = read_csv_rows(rules_path)[0]
+            rule["audit_event_id"] = next(
+                event["event_id"] for event in read_audit_events(ledger)
+                if event["event_type"] == "ledger_initialized"
+            )
+            atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, (rule,))
+            (ledger / "inputs" / "b.csv").write_text(
+                header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,978.00,B-1\n",
+                encoding="utf-8",
+            )
+            expected = self._ledger_bytes(ledger)
+
+            rejected = subprocess.run(
+                self._csv_command(ledger, "inputs/b.csv"), capture_output=True, text=True,
             )
 
             self.assertEqual(3, rejected.returncode)
