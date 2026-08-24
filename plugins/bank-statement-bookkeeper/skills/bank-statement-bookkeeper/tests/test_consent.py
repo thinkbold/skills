@@ -26,7 +26,7 @@ from bookkeeper.consent import (
     proposal_to_dict,
     record_external_decision,
 )
-from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS
+from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext
 from bookkeeper.ledger import initialize_ledger
 from bookkeeper.storage import read_audit_events, read_csv_rows
 import import_statements
@@ -54,6 +54,12 @@ class ConsentTests(unittest.TestCase):
             redactions=("mask account header",),
             manual_alternative="Enter page 2 into a local CSV template.",
         )
+        self.account = AccountContext("checking-001", "Synthetic Bank", "***1001", "CAD")
+        self.account_path = self.ledger / "work" / "confirmed-account.json"
+        self.account_path.write_text(json.dumps({
+            "account_id": "checking-001", "institution": "Synthetic Bank",
+            "masked_label": "***1001", "currency": "CAD",
+        }), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.directory.cleanup()
@@ -84,8 +90,24 @@ class ConsentTests(unittest.TestCase):
             return_code = import_statements.main([
                 "external-result", str(self.ledger), str(result_path), "--consent-id", consent_id,
                 "--provider", PROVIDER, "--source-hash", SOURCE_HASH,
+                "--account", str(self.account_path),
             ])
         return return_code, json.loads(output.getvalue())
+
+    def _external_subprocess(
+        self,
+        result_path: Path,
+        consent_id: str,
+        account_path: Path | None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            sys.executable, str(SKILL_ROOT / "scripts" / "import_statements.py"),
+            "external-result", str(self.ledger), str(result_path), "--consent-id", consent_id,
+            "--provider", PROVIDER, "--source-hash", SOURCE_HASH,
+        ]
+        if account_path is not None:
+            command.extend(("--account", str(account_path)))
+        return subprocess.run(command, capture_output=True, text=True)
 
     def _ledger_bytes(self) -> dict[str, bytes]:
         return {
@@ -94,12 +116,32 @@ class ConsentTests(unittest.TestCase):
             if path.is_file()
         }
 
+    def _import_authority_bytes(self) -> dict[str, bytes]:
+        paths = (
+            self.ledger / "audit" / "audit.jsonl",
+            self.ledger / "merchant-rules.csv",
+            self.ledger / "work" / "corrections.jsonl",
+            self.ledger / "work" / "import-manifest.json",
+            self.ledger / "work" / "normalized-transactions.csv",
+        )
+        result = {
+            path.relative_to(self.ledger).as_posix(): path.read_bytes()
+            for path in paths if path.is_file()
+        }
+        contributions = self.ledger / "work" / "import-contributions"
+        if contributions.is_dir():
+            result.update({
+                path.relative_to(self.ledger).as_posix(): path.read_bytes()
+                for path in sorted(contributions.rglob("*")) if path.is_file()
+            })
+        return result
+
     def test_full_statement_data_scope_admits_matching_local_result(self) -> None:
         """Catches blocking a canonical result authorized for every populated statement-data group."""
         consent_id = self._authorize()
 
         result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result.csv",
         )
 
@@ -118,7 +160,7 @@ class ConsentTests(unittest.TestCase):
         consent_id = self._authorize_proposal(proposal)
 
         result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result.csv",
         )
 
@@ -128,7 +170,7 @@ class ConsentTests(unittest.TestCase):
         """Catches an authorized group being absent from a returned canonical row."""
         consent_id = self._authorize()
         result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             self._write_result("missing-description-group.csv", {"raw_description": "", "reference": ""}),
         )
 
@@ -145,7 +187,7 @@ class ConsentTests(unittest.TestCase):
         consent_id = self._authorize_proposal(proposal)
 
         result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result.csv",
         )
 
@@ -191,22 +233,34 @@ class ConsentTests(unittest.TestCase):
         consent_id = record_external_decision(self.ledger, self.proposal, False, "user")
 
         result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             self.ledger / "inputs" / "does-not-exist.csv",
         )
 
         self.assertEqual("EXTERNAL_NOT_AUTHORIZED", result.issues[0].code)
+
+    def test_invalid_account_context_is_rejected_before_result_is_read(self) -> None:
+        """Catches direct admission opening returned bytes before validating confirmed account context."""
+        consent_id = self._authorize()
+        invalid = AccountContext("checking-001", "Synthetic Bank", "123456", "CAD")
+
+        result = admit_external_result(
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, invalid,
+            self.ledger / "inputs" / "does-not-exist.csv",
+        )
+
+        self.assertEqual("ACCOUNT_UNCONFIRMED", result.issues[0].code)
 
     def test_provider_and_source_mismatches_are_rejected_before_result_is_read(self) -> None:
         """Catches an approval being reused for a different provider or statement source."""
         consent_id = self._authorize()
 
         provider_result = admit_external_result(
-            self.ledger, consent_id, "Different OCR Provider", SOURCE_HASH,
+            self.ledger, consent_id, "Different OCR Provider", SOURCE_HASH, self.account,
             self.ledger / "inputs" / "missing.csv",
         )
         source_result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, "b" * 64,
+            self.ledger, consent_id, PROVIDER, "b" * 64, self.account,
             self.ledger / "inputs" / "missing.csv",
         )
 
@@ -217,11 +271,11 @@ class ConsentTests(unittest.TestCase):
         """Catches a consent for page 2/date-description-amount admitting another result shape."""
         consent_id = self._authorize()
         page_result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result-page-3.csv",
         )
         fields_result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result-missing-amount.csv",
         )
 
@@ -234,7 +288,7 @@ class ConsentTests(unittest.TestCase):
         declined_id = record_external_decision(self.ledger, self.proposal, False, "user")
 
         result = admit_external_result(
-            self.ledger, approved_id, PROVIDER, SOURCE_HASH,
+            self.ledger, approved_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result.csv",
         )
 
@@ -275,11 +329,11 @@ class ConsentTests(unittest.TestCase):
         """Catches admitting canonical rows without third-party provider provenance or page evidence."""
         consent_id = self._authorize()
         method_result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result-provider-mismatch.csv",
         )
         provenance_result = admit_external_result(
-            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
             FIXTURES / "external-result-no-page.csv",
         )
 
@@ -292,7 +346,7 @@ class ConsentTests(unittest.TestCase):
         for value in ("NaN", "Infinity"):
             with self.subTest(value=value):
                 result = admit_external_result(
-                    self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+                    self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
                     self._write_result(f"{value}.csv", {"inflow": value, "outflow": "0"}),
                 )
                 self.assertEqual("EXTERNAL_RESULT_INVALID", result.issues[0].code)
@@ -310,7 +364,7 @@ class ConsentTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 path = self.ledger / "work" / filename
                 path.write_text(",".join(header) + "\n" + ",".join(values) + "\n", encoding="utf-8")
-                result = admit_external_result(self.ledger, consent_id, PROVIDER, SOURCE_HASH, path)
+                result = admit_external_result(self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account, path)
                 self.assertEqual("EXTERNAL_RESULT_INVALID", result.issues[0].code)
 
     def test_result_rejects_invalid_dates_and_missing_required_values(self) -> None:
@@ -322,7 +376,8 @@ class ConsentTests(unittest.TestCase):
         }.items():
             with self.subTest(filename=filename):
                 result = admit_external_result(
-                    self.ledger, consent_id, PROVIDER, SOURCE_HASH, self._write_result(filename, changes),
+                    self.ledger, consent_id, PROVIDER, SOURCE_HASH, self.account,
+                    self._write_result(filename, changes),
                 )
                 self.assertEqual("EXTERNAL_RESULT_INVALID", result.issues[0].code)
 
@@ -332,7 +387,9 @@ class ConsentTests(unittest.TestCase):
         other = Path(self.directory.name) / "other"
         initialize_ledger(other, "other", "Other", "CAD", None)
 
-        result = admit_external_result(other, consent_id, PROVIDER, SOURCE_HASH, FIXTURES / "external-result.csv")
+        result = admit_external_result(
+            other, consent_id, PROVIDER, SOURCE_HASH, self.account, FIXTURES / "external-result.csv",
+        )
 
         self.assertEqual("EXTERNAL_NOT_AUTHORIZED", result.issues[0].code)
 
@@ -366,6 +423,7 @@ class ConsentTests(unittest.TestCase):
             self.assertEqual(0, import_statements.main([
                 "external-result", str(self.ledger), str(returned), "--consent-id", consent_id,
                 "--provider", PROVIDER, "--source-hash", SOURCE_HASH,
+                "--account", str(self.account_path),
             ]))
         self.assertEqual("imported", json.loads(result_output.getvalue())["status"])
 
@@ -435,6 +493,125 @@ class ConsentTests(unittest.TestCase):
         ]
         self.assertEqual(SOURCE_HASH, consent_events[0]["payload"]["source_hash"])
 
+    def test_cli_external_result_requires_an_account_context_argument(self) -> None:
+        """Catches admitting provider account fields when no confirmed local account was selected."""
+        consent_id = self._authorize()
+        returned = self._write_result("missing-account-argument.csv", {})
+
+        rejected = self._external_subprocess(returned, consent_id, None)
+
+        self.assertEqual(2, rejected.returncode)
+        self.assertEqual("USAGE", json.loads(rejected.stdout)["error"])
+
+    def test_cli_rejects_invalid_account_context_before_reading_the_returned_file(self) -> None:
+        """Catches opening returned bytes before rejecting blank or unmasked local account confirmation."""
+        consent_id = self._authorize()
+        missing_result = self.ledger / "work" / "must-not-be-read.csv"
+        cases = {
+            "blank": {
+                "account_id": "", "institution": "Synthetic Bank",
+                "masked_label": "***1001", "currency": "CAD",
+            },
+            "unmasked": {
+                "account_id": "checking-001", "institution": "Synthetic Bank",
+                "masked_label": "123456", "currency": "CAD",
+            },
+        }
+        for name, account in cases.items():
+            with self.subTest(name=name):
+                self.account_path.write_text(json.dumps(account), encoding="utf-8")
+                expected = self._ledger_bytes()
+
+                rejected = self._external_subprocess(missing_result, consent_id, self.account_path)
+
+                self.assertEqual(3, rejected.returncode)
+                self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+                self.assertEqual(expected, self._ledger_bytes())
+
+    def test_cli_matching_account_context_is_authoritative_for_sanitized_rows(self) -> None:
+        """Catches provider account fields bypassing the selected local account context."""
+        consent_id = self._authorize()
+        returned = self._write_result("matching-account.csv", {
+            "account_id": "checking-001", "currency": "CAD",
+        })
+
+        admitted = self._external_subprocess(returned, consent_id, self.account_path)
+
+        self.assertEqual(0, admitted.returncode, admitted.stdout)
+        row = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")[0]
+        self.assertEqual(("checking-001", "CAD"), (row["account_id"], row["currency"]))
+
+    def test_cli_blocks_account_and_currency_mismatches_without_ledger_mutation(self) -> None:
+        """Catches provider account or currency values overriding one confirmed local unit."""
+        consent_id = self._authorize()
+        for filename, changes in {
+            "wrong-account.csv": {"account_id": "savings-002"},
+            "wrong-currency.csv": {"currency": "USD"},
+        }.items():
+            with self.subTest(filename=filename):
+                returned = self._write_result(filename, changes)
+                expected = self._import_authority_bytes()
+
+                blocked = self._external_subprocess(returned, consent_id, self.account_path)
+
+                self.assertEqual(0, blocked.returncode, blocked.stdout)
+                self.assertEqual({"status": "blocked", "issues": ["EXTERNAL_ACCOUNT_MISMATCH"]}, json.loads(blocked.stdout))
+                self.assertEqual(expected, self._import_authority_bytes())
+                self.assertEqual(
+                    "blocked",
+                    json.loads((self.ledger / "outputs" / "status.json").read_text(encoding="utf-8"))["state"],
+                )
+                self.assertIn(
+                    "EXTERNAL_ACCOUNT_MISMATCH",
+                    {row["code"] for row in read_csv_rows(self.ledger / "outputs" / "exceptions.csv")},
+                )
+
+    def test_cli_blocks_mixed_account_or_currency_rows_as_one_unit_without_mutation(self) -> None:
+        """Catches silently partitioning a multi-account external result under one confirmed context."""
+        consent_id = self._authorize()
+        with (FIXTURES / "external-result.csv").open("r", encoding="utf-8", newline="") as handle:
+            first = next(csv.DictReader(handle))
+        second = dict(first)
+        second.update({
+            "transaction_id": "external-2", "transaction_date": "2026-01-06", "posting_date": "2026-01-06",
+            "account_id": "savings-002", "currency": "USD", "reference": "SYN-2",
+            "source_page_or_row": "page:2/row:2", "source_locations": "inputs/synthetic.pdf:page:2/row:2",
+        })
+        returned = self.ledger / "work" / "mixed-account-result.csv"
+        with returned.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CANONICAL_TRANSACTION_FIELDS)
+            writer.writeheader()
+            writer.writerows((first, second))
+        expected = self._import_authority_bytes()
+
+        blocked = self._external_subprocess(returned, consent_id, self.account_path)
+
+        self.assertEqual(0, blocked.returncode, blocked.stdout)
+        self.assertEqual({"status": "blocked", "issues": ["EXTERNAL_ACCOUNT_MISMATCH"]}, json.loads(blocked.stdout))
+        self.assertEqual(expected, self._import_authority_bytes())
+        self.assertEqual(
+            "blocked", json.loads((self.ledger / "outputs" / "status.json").read_text(encoding="utf-8"))["state"],
+        )
+
+    def test_cli_rejects_outside_and_cross_ledger_account_context_without_target_mutation(self) -> None:
+        """Catches loading confirmed account context from outside the selected ledger."""
+        consent_id = self._authorize()
+        returned = self._write_result("account-path-result.csv", {})
+        other_ledger = Path(self.directory.name) / "other-account-ledger"
+        initialize_ledger(other_ledger, "other-account", "Other", "CAD", None)
+        cross_ledger = other_ledger / "work" / "account.json"
+        outside = Path(self.directory.name) / "outside-account.json"
+        for path in (cross_ledger, outside):
+            path.write_bytes(self.account_path.read_bytes())
+        expected = self._ledger_bytes()
+
+        for account_path in (cross_ledger, outside):
+            with self.subTest(account_path=account_path):
+                rejected = self._external_subprocess(returned, consent_id, account_path)
+                self.assertEqual(3, rejected.returncode)
+                self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+                self.assertEqual(expected, self._ledger_bytes())
+
     def test_cli_external_result_rerun_is_byte_event_and_row_idempotent(self) -> None:
         """Catches a repeated admitted result changing bytes, IDs, rows, or audit events."""
         consent_id = self._authorize()
@@ -490,6 +667,7 @@ class ConsentTests(unittest.TestCase):
             second_code = import_statements.main([
                 "external-result", str(self.ledger), str(unrelated), "--consent-id", second_id,
                 "--provider", PROVIDER, "--source-hash", second_hash,
+                "--account", str(self.account_path),
             ])
 
         self.assertEqual(0, second_code, output.getvalue())
