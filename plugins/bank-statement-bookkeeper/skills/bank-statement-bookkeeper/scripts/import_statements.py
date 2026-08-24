@@ -9,6 +9,12 @@ from pathlib import Path
 import sys
 
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult
+from bookkeeper.consent import (
+    admit_external_result,
+    proposal_from_dict,
+    proposal_to_dict,
+    record_external_decision,
+)
 from bookkeeper.importing import (
     AccountCandidate,
     CsvMapping,
@@ -187,6 +193,41 @@ def _correct_row(ledger_root: Path, args: argparse.Namespace) -> dict[str, objec
     return {"status": "corrected", "transaction_id": args.transaction_id, "audit_event_id": corrected_row["review_note"]}
 
 
+def _proposal_path(ledger_root: Path, requested: str) -> Path:
+    path = resolve_inside_ledger(ledger_root, requested)
+    if not path.is_file():
+        raise ValueError("proposal JSON must be a ledger-local file")
+    return path
+
+
+def _read_proposal(ledger_root: Path, requested: str):
+    path = _proposal_path(ledger_root, requested)
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("proposal JSON must be an object")
+    return path, proposal_from_dict(payload)
+
+
+def _propose_external(ledger_root: Path, proposal_file: str) -> dict[str, object]:
+    path, proposal = _read_proposal(ledger_root, proposal_file)
+    atomic_write_json(path, proposal_to_dict(proposal))
+    return proposal_to_dict(proposal)
+
+
+def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
+    _, proposal = _read_proposal(ledger_root, args.proposal)
+    consent_id = record_external_decision(ledger_root, proposal, args.decision == "authorized", args.actor)
+    return {"status": "authorized" if args.decision == "authorized" else "declined", "consent_id": consent_id}
+
+
+def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
+    result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, args.result)
+    if result.issues:
+        return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
+    return {"status": "admitted", "transaction_count": len(result.transactions)}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -210,6 +251,20 @@ def _parser() -> argparse.ArgumentParser:
     correction.add_argument("--value", required=True)
     correction.add_argument("--reason", required=True)
     correction.add_argument("--actor", required=True)
+    proposal = commands.add_parser("propose-external")
+    proposal.add_argument("ledger_dir", type=Path)
+    proposal.add_argument("proposal")
+    consent = commands.add_parser("record-consent")
+    consent.add_argument("ledger_dir", type=Path)
+    consent.add_argument("proposal")
+    consent.add_argument("--decision", required=True, choices=("authorized", "declined"))
+    consent.add_argument("--actor", required=True)
+    external_result = commands.add_parser("external-result")
+    external_result.add_argument("ledger_dir", type=Path)
+    external_result.add_argument("result", type=Path)
+    external_result.add_argument("--consent-id", required=True)
+    external_result.add_argument("--provider", required=True)
+    external_result.add_argument("--source-hash", required=True)
     return parser
 
 
@@ -241,6 +296,12 @@ def main(argv: list[str] | None = None) -> int:
                 ledger_root, source, source_identity, _mapping(_read_ledger_json(ledger_root, args.mapping)),
                 _account(_read_ledger_json(ledger_root, args.account)),
             )
+        elif args.command == "propose-external":
+            output = _propose_external(ledger_root, args.proposal)
+        elif args.command == "record-consent":
+            output = _record_consent(ledger_root, args)
+        elif args.command == "external-result":
+            output = _external_result(ledger_root, args)
         else:
             output = _correct_row(ledger_root, args)
     except (OSError, ValueError, json.JSONDecodeError) as error:

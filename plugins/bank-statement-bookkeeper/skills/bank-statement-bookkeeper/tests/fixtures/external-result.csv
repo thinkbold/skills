@@ -1,0 +1,2 @@
+transaction_id,account_id,currency,transaction_date,posting_date,raw_description,normalized_merchant,inflow,outflow,running_balance,reference,source_file,source_page_or_row,extraction_method,extraction_confidence,classification_status,account_code,account_name,rule_id,review_note,source_locations
+external-1,checking-001,CAD,2026-01-05,2026-01-05,Synthetic merchant,,0,20.00,980.00,SYN-1,inputs/synthetic.pdf,page:2/row:1,third_party:Synthetic OCR Provider,medium,unclassified,,,,,inputs/synthetic.pdf:page:2/row:1
