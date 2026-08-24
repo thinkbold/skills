@@ -1,7 +1,7 @@
 # Bank Statement Bookkeeper Plugin Design
 
 **Date:** 2026-08-23
-**Status:** Approved in chat; awaiting review of this written specification
+**Status:** Approved by the user on 2026-08-24
 
 ## 1. Purpose
 
