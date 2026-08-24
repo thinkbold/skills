@@ -308,7 +308,9 @@ def recover_pending_operation(ledger_root: Path) -> str | None:
     }
     if not isinstance(journal, dict) or set(journal) != required or not isinstance(journal["event_payload"], dict):
         raise ValueError("pending classification operation is invalid")
-    _install_staged_file(ledger_root, _STAGED_TRANSACTIONS_PATH, _CANONICAL_PATH, str(journal["transactions_sha256"]))
+    transactions_hash = journal["transactions_sha256"]
+    if transactions_hash is not None:
+        _install_staged_file(ledger_root, _STAGED_TRANSACTIONS_PATH, _CANONICAL_PATH, str(transactions_hash))
     _install_staged_file(ledger_root, _STAGED_RULES_PATH, _RULES_PATH, str(journal["rules_sha256"]))
     event_id = append_audit_event(
         ledger_root, str(journal["event_type"]), dict(journal["event_payload"]),
@@ -319,6 +321,33 @@ def recover_pending_operation(ledger_root: Path) -> str | None:
     journal_path.unlink()
     resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH).unlink(missing_ok=True)
     resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH).unlink(missing_ok=True)
+    return event_id
+
+
+def _stage_rule_operation(
+    ledger_root: Path,
+    rules: list[dict[str, str]],
+    event_type: str,
+    rule_id: str,
+    actor: str,
+    operation_key: str,
+) -> str:
+    """Stage a rules-only lifecycle target before appending its audit event."""
+    event_id = uuid4().hex
+    rules_path = resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH)
+    atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, rules)
+    atomic_write_json(resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH), {
+        "actor": actor,
+        "audit_event_id": event_id,
+        "event_payload": {"rule_id": rule_id},
+        "event_type": event_type,
+        "operation_key": operation_key,
+        "rules_sha256": sha256_file(rules_path),
+        "transactions_sha256": None,
+    })
+    recovered = recover_pending_operation(ledger_root)
+    if recovered != event_id:
+        raise ValueError("rule lifecycle operation did not recover its audit event")
     return event_id
 
 
@@ -486,24 +515,34 @@ def export_rules(ledger_root: Path, destination: str | Path) -> Path:
 def deactivate_rule(ledger_root: Path, rule_id: str, actor: str) -> str:
     """Mark one active rule inactive and append an auditable lifecycle event."""
     recover_pending_operation(ledger_root)
+    operation_key = _operation_key("deactivate-rule", {"rule_id": rule_id})
+    completed = _completed_operation(ledger_root, operation_key)
+    if completed is not None:
+        return completed
     rules = load_rules(ledger_root)
     matches = [rule for rule in rules if rule.get("rule_id") == rule_id]
     if len(matches) != 1:
         raise ValueError("rule ID must identify exactly one rule")
-    event_id = append_audit_event(ledger_root, "merchant_rule_deactivated", {"rule_id": rule_id}, actor=actor, dedupe_key=f"merchant-rule-deactivate:{rule_id}")
+    if matches[0].get("status") != "active":
+        raise ValueError("rule must be active to deactivate")
     matches[0]["status"] = "inactive"
     matches[0]["updated_at"] = _timestamp()
-    _write_rules(ledger_root, rules)
-    return event_id
+    return _stage_rule_operation(
+        ledger_root, rules, "merchant_rule_deactivated", rule_id, actor, operation_key,
+    )
 
 
 def delete_rule(ledger_root: Path, rule_id: str, actor: str) -> str:
     """Remove the current rule row while retaining an append-only audit record."""
     recover_pending_operation(ledger_root)
+    operation_key = _operation_key("delete-rule", {"rule_id": rule_id})
+    completed = _completed_operation(ledger_root, operation_key)
+    if completed is not None:
+        return completed
     rules = load_rules(ledger_root)
     kept = [rule for rule in rules if rule.get("rule_id") != rule_id]
     if len(kept) == len(rules):
         raise ValueError("rule ID must identify exactly one rule")
-    event_id = append_audit_event(ledger_root, "merchant_rule_deleted", {"rule_id": rule_id}, actor=actor, dedupe_key=f"merchant-rule-delete:{rule_id}")
-    _write_rules(ledger_root, kept)
-    return event_id
+    return _stage_rule_operation(
+        ledger_root, kept, "merchant_rule_deleted", rule_id, actor, operation_key,
+    )
