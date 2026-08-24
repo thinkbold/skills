@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Mapping
 
 from .contracts import BALANCE_FIELDS, MERCHANT_RULE_FIELDS, SCHEMA_VERSION
@@ -21,6 +23,21 @@ _CONFIG_FIELDS = (
     "created_at",
 )
 _FISCAL_YEAR_END_PATTERN = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$")
+
+
+def lexical_ledger_root(root: Path) -> Path:
+    """Return the caller-selected ledger path without following a symlink.
+
+    Ledger selection is an authorization boundary.  ``Path.resolve`` is unsafe
+    here because it turns a selected symlink into an apparently ordinary
+    directory before the caller can reject it.
+    """
+    selected = Path(os.path.abspath(os.fspath(root)))
+    if selected.exists() or selected.is_symlink():
+        mode = os.lstat(selected).st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ValueError("ledger root is not a real directory")
+    return selected
 
 
 def _utc_timestamp(now: datetime | None) -> str:
@@ -51,7 +68,8 @@ def validate_ledger_config(config: Mapping[str, object]) -> dict[str, object]:
 
 def load_ledger(root: Path) -> dict[str, object]:
     """Load and validate the selected ledger's configuration."""
-    config_path = resolve_inside_ledger(root, "ledger.json")
+    ledger_root = lexical_ledger_root(root)
+    config_path = resolve_inside_ledger(ledger_root, "ledger.json")
     if not config_path.is_file():
         raise ValueError(f"ledger config does not exist: {config_path}")
     with config_path.open("r", encoding="utf-8") as handle:
@@ -70,7 +88,7 @@ def initialize_ledger(
     now: datetime | None = None,
 ) -> dict[str, object]:
     """Create or verify one isolated ledger and return its configuration."""
-    ledger_root = Path(root)
+    ledger_root = lexical_ledger_root(root)
     if ledger_root.exists() and not ledger_root.is_dir():
         raise ValueError(f"ledger root is not a directory: {ledger_root}")
     if ledger_root.exists() and any(ledger_root.iterdir()):

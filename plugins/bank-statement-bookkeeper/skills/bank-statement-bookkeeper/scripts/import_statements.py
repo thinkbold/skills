@@ -289,8 +289,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        ledger_root = args.ledger_dir.resolve()
+        # Do not resolve the caller selected root before the ledger gate can
+        # reject a symlinked ledger path.
+        ledger_root = args.ledger_dir
         load_ledger(ledger_root)
+        # The selected lexical path has now been checked; use one canonical
+        # spelling for containment comparisons inside the command.
+        ledger_root = ledger_root.resolve()
         recover_ledger_workflow(ledger_root)
         if args.command == "inventory":
             inputs = tuple(_ledger_input(ledger_root, path) for path in args.inputs)

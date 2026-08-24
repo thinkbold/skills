@@ -286,6 +286,29 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
             self.assertEqual([], list(empty.iterdir()))
 
+    def test_public_commands_reject_a_selected_ledger_symlink_without_mutation(self) -> None:
+        """Catches resolving a caller-selected ledger symlink before its lexical lstat gate."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            selected = Path(temp) / "selected-ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            selected.symlink_to(ledger, target_is_directory=True)
+            before = {path.relative_to(ledger).as_posix(): path.read_bytes() for path in ledger.rglob("*") if path.is_file()}
+            commands = (
+                ("import_statements.py", "inventory", str(selected), "inputs/missing.csv"),
+                ("classify_transactions.py", "pending", str(selected)),
+                ("reconcile_accounts.py", str(selected)),
+                ("validate_ledger.py", str(selected)),
+                ("init_ledger.py", str(selected), "--ledger-id", "synthetic", "--company-name", "Synthetic", "--base-currency", "CAD"),
+            )
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    result = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / command[0]), *command[1:]], capture_output=True, text=True)
+                    self.assertEqual(3, result.returncode)
+                    self.assertEqual({"error": "LEDGER_SCHEMA_INVALID"}, json.loads(result.stdout))
+            after = {path.relative_to(ledger).as_posix(): path.read_bytes() for path in ledger.rglob("*") if path.is_file()}
+            self.assertEqual(before, after)
+
 
 if __name__ == "__main__":
     unittest.main()
