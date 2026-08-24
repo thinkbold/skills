@@ -1,0 +1,22 @@
+{
+  "name": "bank-statement-bookkeeper",
+  "version": "0.1.0",
+  "description": "Prepare, classify, and reconcile bank statement transactions with ledger-local memory.",
+  "author": {"name": "ThinkBold"},
+  "license": "MIT",
+  "keywords": ["bank-statements", "bookkeeping", "reconciliation"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Bank Statement Bookkeeper",
+    "shortDescription": "Classify and reconcile bank statement transactions",
+    "longDescription": "Convert supported PDF and CSV bank statements into auditable, ledger-local bookkeeping data with user-confirmed merchant rules and account reconciliation.",
+    "developerName": "ThinkBold",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Process bank statements for this company ledger.",
+      "Classify new merchants and remember my answers.",
+      "Reconcile each bank account and report exceptions."
+    ]
+  }
+}
