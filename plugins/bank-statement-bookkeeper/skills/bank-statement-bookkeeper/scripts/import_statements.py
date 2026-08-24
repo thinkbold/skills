@@ -160,14 +160,15 @@ def _write_pdf_import(
     mapping: CsvMapping,
     account: AccountContext,
 ) -> dict[str, object]:
+    source_hash = sha256_file(source)
     extraction = extract_pdf_pages(
         source, resolve_inside_ledger(ledger_root, "work"), detect_pdf_capabilities(),
     )
-    mapped = map_pdf_tables(extraction, mapping, account, source_file=source_identity)
+    mapped = map_pdf_tables(extraction, mapping, account, source_file=source_identity, source_hash=source_hash)
     result = ImportResult(
         transactions=mapped.transactions,
         issues=mapped.issues,
-        source_hashes={source_identity: sha256_file(source)},
+        source_hashes={source_identity: source_hash},
         staged_files=(extraction.staged_pdf,) if extraction.staged_pdf else (),
     )
     return _record_import(ledger_root, source_identity, result, "pdf_import_recorded")
