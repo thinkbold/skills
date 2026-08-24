@@ -215,12 +215,13 @@ def validate_period_continuity(balance_rows: Iterable[Mapping[str, str]]) -> tup
 
 
 def _balance_value(row: Mapping[str, str], field: str) -> Decimal | None:
-    value = row.get(field, "").strip()
+    value = row.get(field, "")
+    value = value.strip() if isinstance(value, str) else ""
     return _decimal(value) if value else None
 
 
 def _confirmed(value: str) -> bool | None:
-    normalized = value.strip().lower()
+    normalized = value.strip().lower() if isinstance(value, str) else ""
     if normalized in {"true", "yes", "1"}:
         return True
     if normalized in {"false", "no", "0", ""}:
@@ -265,18 +266,35 @@ def reconcile_all(
             local_issues.append(_blocking("BALANCE_EVIDENCE_INVALID", "Balance confirmation must be true or false."))
         elif not confirmed:
             local_issues.append(_pending("BALANCE_UNCONFIRMED", "Balance evidence is not confirmed."))
-        opening_missing = confirmed is False or any(not evidence.get(field, "").strip() for field in (
+        source_type = evidence.get("opening_source_type", "") if isinstance(evidence.get("opening_source_type", ""), str) else ""
+        opening_missing = confirmed is False or any(not isinstance(evidence.get(field, ""), str) or not evidence.get(field, "").strip() for field in (
             "opening_balance", "opening_source_type", "opening_source_file", "opening_source_location",
         ))
-        closing_missing = confirmed is False or any(not evidence.get(field, "").strip() for field in (
+        closing_missing = confirmed is False or any(not isinstance(evidence.get(field, ""), str) or not evidence.get(field, "").strip() for field in (
             "closing_balance", "closing_source_file", "closing_source_location",
         ))
+        derived_opening: Decimal | None = None
+        if source_type == "prior_year_end_statement" and confirmed is True:
+            try:
+                prior_end = _date(period_start) - timedelta(days=1)
+                predecessors = [candidate for candidate in source_rows if candidate is not evidence and candidate.get("account_id") == account_id and candidate.get("currency") == currency and candidate.get("period_end") == prior_end.isoformat()]
+                if len(predecessors) != 1 or _confirmed(predecessors[0].get("confirmed", "")) is not True:
+                    raise ValueError
+                derived_opening = _balance_value(predecessors[0], "closing_balance")
+                if derived_opening is None:
+                    raise ValueError
+                claimed = _balance_value(evidence, "opening_balance")
+                if claimed is not None and claimed != derived_opening:
+                    local_issues.append(_blocking("BALANCE_EVIDENCE_INVALID", "Claimed opening balance contradicts confirmed predecessor closing."))
+                opening_missing = False
+            except (ValueError, InvalidOperation):
+                opening_missing = True
         if opening_missing:
             local_issues.append(_pending("OPENING_BALANCE_MISSING", "Opening balance and source provenance are required."))
         if closing_missing:
             local_issues.append(_pending("CLOSING_BALANCE_MISSING", "Closing balance and source provenance are required."))
         try:
-            opening = None if opening_missing else _balance_value(evidence, "opening_balance")
+            opening = derived_opening if derived_opening is not None else (None if opening_missing else _balance_value(evidence, "opening_balance"))
             closing = None if closing_missing else _balance_value(evidence, "closing_balance")
         except (InvalidOperation, ValueError):
             opening = closing = None
@@ -291,8 +309,7 @@ def reconcile_all(
         output.append(reconcile_account_period(
             account_id, currency, opening, (row.get("inflow", "0") for row in selected),
             (row.get("outflow", "0") for row in selected), closing, period_start, period_end,
-            evidence.get("opening_source_type", ""),
-            evidence.get("opening_source_location", "") if evidence.get("opening_source_type", "") == "prior_year_end_statement" else period_start,
+            source_type, evidence.get("opening_source_location", "") if source_type == "prior_year_end_statement" else period_start,
             tolerance=tolerance, issues=local_issues,
         ))
     for (account_id, currency), unit_transactions in sorted(transactions_by_unit.items()):
@@ -339,7 +356,12 @@ def load_balance_rows(ledger_root: Path) -> tuple[tuple[dict[str, str], ...], tu
             reader = csv.DictReader(handle)
             if tuple(reader.fieldnames or ()) != BALANCE_FIELDS:
                 return (), (_blocking("BALANCE_SCHEMA_INVALID", "Account balance CSV has unsupported columns."),)
-            rows = tuple(dict(row) for row in reader)
+            rows = []
+            for raw in reader:
+                if None in raw or any(raw.get(field) is None for field in BALANCE_FIELDS):
+                    return (), (_blocking("BALANCE_SCHEMA_INVALID", "Account balance CSV has malformed rows."),)
+                rows.append({field: str(raw[field]) for field in BALANCE_FIELDS})
+            rows = tuple(rows)
     except (OSError, csv.Error, UnicodeError):
         return (), (_blocking("BALANCE_SCHEMA_INVALID", "Account balance CSV cannot be read."),)
     if any(set(row) != set(BALANCE_FIELDS) for row in rows):

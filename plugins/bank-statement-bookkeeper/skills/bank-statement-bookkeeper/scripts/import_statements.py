@@ -34,6 +34,7 @@ from bookkeeper.storage import (
     mask_account_label,
     read_csv_rows,
     resolve_inside_ledger,
+    replace_active_issues,
     sha256_file,
 )
 
@@ -120,6 +121,7 @@ def _record_import(
     result: ImportResult,
     event_type: str,
 ) -> dict[str, object]:
+    replace_active_issues(ledger_root, "import", {"source": source_identity}, result.issues)
     if result.issues:
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
     manifest = _manifest(ledger_root)
@@ -224,6 +226,7 @@ def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, ob
 
 def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
     result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, args.result)
+    replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, result.issues)
     if result.issues:
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
     return {"status": "admitted", "transaction_count": len(result.transactions)}
@@ -280,6 +283,10 @@ def main(argv: list[str] | None = None) -> int:
             candidates = discover_account_candidates(tuple(
                 _candidate_from_csv(source, identity) for source, identity in inputs
             ))
+            replace_active_issues(
+                ledger_root, "inventory", {"sources": tuple(sorted(identity for _, identity in inputs))},
+                tuple(issue for candidate in candidates for issue in candidate.issues),
+            )
             output: dict[str, object] = {
                 "candidate_count": len(candidates),
                 "candidates": [_candidate_summary(candidate) for candidate in candidates],
