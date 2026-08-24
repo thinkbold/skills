@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import csv
+import os
 import re
+import shutil
 from pathlib import Path
 from typing import Iterable, Mapping
 from datetime import date
@@ -13,8 +16,8 @@ from decimal import Decimal, InvalidOperation
 
 from .contracts import Issue, RunState
 from .contracts import CANONICAL_TRANSACTION_FIELDS
-from .reconciliation import ReconciliationRow
-from .storage import atomic_write_csv, atomic_write_json, resolve_inside_ledger
+from .reconciliation import ACCOUNT_SUMMARY_FIELDS, RECONCILIATION_FIELDS, ReconciliationRow, load_balance_rows, reconcile_all
+from .storage import append_audit_event, atomic_write_csv, atomic_write_json, load_active_issues, resolve_inside_ledger, sha256_file
 
 
 _BLOCKING_CODES = frozenset({
@@ -27,6 +30,10 @@ _BLOCKING_CODES = frozenset({
     "UNRESOLVED_DUPLICATE_CANDIDATE", "CHART_REFERENCE_INVALID",
 })
 _EXCEPTION_FIELDS = ("code", "blocking", "message", "source_file", "source_location")
+_PENDING_GROUP_FIELDS = ("group_id", "normalized_merchant", "direction", "currencies", "account_ids", "transaction_count", "totals_by_currency", "date_start", "date_end", "confidence")
+_OUTPUT_BUNDLE_JOURNAL = Path("work") / "pending-derived-output.json"
+_OUTPUT_BUNDLE_STAGE = Path("work") / "pending-derived-output-stage"
+_OUTPUT_BUNDLE_BACKUP = Path("work") / "pending-derived-output-backup"
 
 
 def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[Issue, ...]:
@@ -196,4 +203,198 @@ def finalize_outputs(
         "unit_count": len(reconciliation_rows),
     }
     atomic_write_json(outputs / "status.json", status)
+    return status
+
+
+def _csv_bytes(fieldnames: tuple[str, ...], rows: Iterable[Mapping[str, object]]) -> bytes:
+    handle = io.StringIO(newline="")
+    writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="raise")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return handle.getvalue().encode("utf-8")
+
+
+def _json_bytes(value: object) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _ordered_transactions(rows: Iterable[Mapping[str, str]]) -> tuple[dict[str, str], ...]:
+    return tuple(sorted((dict(row) for row in rows), key=lambda row: (
+        row.get("account_id", ""), row.get("currency", ""), row.get("transaction_date", ""),
+        row.get("posting_date", ""), row.get("transaction_id", ""),
+    )))
+
+
+def _reconciliation_artifacts(rows: tuple[ReconciliationRow, ...], state: RunState) -> dict[str, bytes]:
+    ordered = tuple(sorted(rows, key=lambda row: (row.account_id, row.currency, row.period_start, row.period_end)))
+    reconciliation = []
+    for row in ordered:
+        reconciliation.append({
+            "account_label": f"account-{hashlib.sha256(row.account_id.encode('utf-8')).hexdigest()[:12]}", "currency": row.currency,
+            "period_start": row.period_start, "period_end": row.period_end,
+            "opening_source_type": row.opening_source_type, "opening_source_date": row.opening_source_date,
+            "opening_balance": _money(row.opening_balance), "inflows": _money(row.inflows), "outflows": _money(row.outflows),
+            "expected_closing": _money(row.expected_closing), "reported_closing": _money(row.reported_closing),
+            "difference": _money(row.difference), "tolerance": _money(row.tolerance), "reconciled": str(row.reconciled).lower(),
+            "issue_codes": "|".join(sorted({issue.code for issue in row.issues})),
+        })
+    summary: dict[tuple[str, str], list[ReconciliationRow]] = {}
+    for row in ordered:
+        summary.setdefault((row.account_id, row.currency), []).append(row)
+    summary_rows = ({
+        "account_label": f"account-{hashlib.sha256(account_id.encode('utf-8')).hexdigest()[:12]}", "currency": currency,
+        "period_count": str(len(unit_rows)), "reconciled_period_count": str(sum(row.reconciled for row in unit_rows)), "state": state.value,
+    } for (account_id, currency), unit_rows in sorted(summary.items()))
+    report = [f"Run state: {state.value}", ""]
+    for item in reconciliation:
+        report.extend((
+            f"## Account: {item['account_label']} | Currency: {item['currency']} | Period: {item['period_start']} to {item['period_end']}",
+            f"Opening source: {item['opening_source_type']} ({item['opening_source_date']})",
+            f"Inflows: {item['inflows']} {item['currency']}", f"Outflows: {item['outflows']} {item['currency']}",
+            f"Expected closing: {item['expected_closing']} {item['currency']}", f"Reported closing: {item['reported_closing']} {item['currency']}",
+            f"Difference: {item['difference']} {item['currency']}", f"Tolerance: {item['tolerance'] or 'none'}",
+            f"Coverage: {item['period_start']} to {item['period_end']}", f"Issues: {item['issue_codes'] or 'none'}", "",
+        ))
+    return {
+        "outputs/account-summary.csv": _csv_bytes(ACCOUNT_SUMMARY_FIELDS, summary_rows),
+        "outputs/reconciliation.csv": _csv_bytes(RECONCILIATION_FIELDS, reconciliation),
+        "outputs/reconciliation-report.md": ("\n".join(report).rstrip() + "\n").encode("utf-8"),
+    }
+
+
+def _money(value: Decimal | None) -> str:
+    return "" if value is None else format(value, "f")
+
+
+def recover_pending_output_bundle(ledger_root: Path) -> None:
+    """Finish an interrupted derived-output installation before exposing a new generation."""
+    journal_path = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_JOURNAL)
+    if not journal_path.exists():
+        return
+    with journal_path.open("r", encoding="utf-8") as handle:
+        journal = json.load(handle)
+    if not isinstance(journal, dict) or set(journal) != {"targets", "version"} or journal["version"] != 1 or not isinstance(journal["targets"], list):
+        raise ValueError("pending derived output journal is invalid")
+    stage_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE)
+    backup_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_BACKUP)
+    for item in journal["targets"]:
+        if not isinstance(item, dict) or set(item) != {"relative", "sha256"}:
+            raise ValueError("pending derived output journal is invalid")
+        relative, expected = str(item["relative"]), str(item["sha256"])
+        target = resolve_inside_ledger(ledger_root, relative)
+        staged = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
+        backup = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_BACKUP / relative)
+        if target.exists() and sha256_file(target) == expected:
+            continue
+        if not staged.exists() or sha256_file(staged) != expected:
+            raise ValueError("pending derived output cannot safely recover")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(target, backup)
+        os.replace(staged, target)
+        if sha256_file(target) != expected:
+            raise ValueError("pending derived output installed an unexpected file")
+    journal_path.unlink()
+    shutil.rmtree(stage_root, ignore_errors=True)
+    shutil.rmtree(backup_root, ignore_errors=True)
+
+
+def _install_output_bundle(ledger_root: Path, artifacts: Mapping[str, bytes]) -> None:
+    recover_pending_output_bundle(ledger_root)
+    stage_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE)
+    backup_root = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_BACKUP)
+    shutil.rmtree(stage_root, ignore_errors=True)
+    shutil.rmtree(backup_root, ignore_errors=True)
+    stage_root.mkdir(parents=True)
+    targets = []
+    try:
+        for relative, payload in sorted(artifacts.items()):
+            staged = resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            with staged.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if sha256_file(staged) != hashlib.sha256(payload).hexdigest():
+                raise ValueError("derived output staging hash mismatch")
+            if relative.endswith(".csv"):
+                with staged.open("r", encoding="utf-8", newline="") as handle:
+                    if csv.DictReader(handle).fieldnames is None:
+                        raise ValueError("derived output CSV is invalid")
+            elif relative.endswith(".json"):
+                json.loads(staged.read_text(encoding="utf-8"))
+            elif not payload.endswith(b"\n"):
+                raise ValueError("derived output text must end with a newline")
+            targets.append({"relative": relative, "sha256": sha256_file(staged)})
+        # Status is deliberately sorted last: it is the generation commit marker.
+        targets.sort(key=lambda item: (item["relative"].endswith("outputs/status.json"), item["relative"]))
+        atomic_write_json(resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_JOURNAL), {"targets": targets, "version": 1})
+        recover_pending_output_bundle(ledger_root)
+    except Exception:
+        # A journal means recovery must preserve the target generation; without one staging is disposable.
+        if not resolve_inside_ledger(ledger_root, _OUTPUT_BUNDLE_JOURNAL).exists():
+            shutil.rmtree(stage_root, ignore_errors=True)
+            shutil.rmtree(backup_root, ignore_errors=True)
+        raise
+
+
+def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = False) -> dict[str, object]:
+    """Publish one complete deterministic ledger-local view, recovering an old view first."""
+    recover_pending_output_bundle(ledger_root)
+    from .classification import apply_exact_rules, build_pending_groups, load_rules
+
+    transactions, canonical_load_issues = load_canonical_for_validation(ledger_root)
+    valid_transactions, canonical_issues = admit_canonical_transactions(transactions)
+    classified = apply_exact_rules(valid_transactions, load_rules(ledger_root))
+    classified_rows = _ordered_transactions(classified.transactions)
+    if not canonical_load_issues and not canonical_issues and len(classified_rows) == len(transactions):
+        atomic_write_csv(resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv"), CANONICAL_TRANSACTION_FIELDS, classified_rows)
+    from .storage import replace_active_issues
+    replace_active_issues(ledger_root, "classification", {"view": "current"}, classified.issues)
+    balance_rows, balance_issues = load_balance_rows(ledger_root)
+    rows = reconcile_all(classified_rows, balance_rows)
+    pending_group_count = count_pending_classifications(classified_rows)
+    issues = collect_ledger_issues((*load_active_issues(ledger_root), *canonical_load_issues, *canonical_issues, *classified.issues, *balance_issues), rows, pending_group_count)
+    state = determine_run_state(bool(transactions), pending_group_count, rows, issues)
+    all_issues = collect_ledger_issues(issues, rows, pending_group_count)
+    exceptions = ({
+        "code": issue.code, "blocking": str(issue.blocking).lower(), "message": f"Issue: {issue.code}",
+        "source_file": _opaque_source(issue.source_file), "source_location": _opaque_source(issue.source_location),
+    } for issue in all_issues)
+    artifacts: dict[str, bytes] = {
+        "outputs/normalized-transactions.csv": _csv_bytes(CANONICAL_TRANSACTION_FIELDS, _ordered_transactions(transactions)),
+        "outputs/classified-transactions.csv": _csv_bytes(CANONICAL_TRANSACTION_FIELDS, classified_rows),
+        "outputs/exceptions.csv": _csv_bytes(_EXCEPTION_FIELDS, exceptions),
+    }
+    artifacts.update(_reconciliation_artifacts(rows, state))
+    groups = build_pending_groups(classified_rows)
+    artifacts["work/pending-merchant-groups.csv"] = _csv_bytes(_PENDING_GROUP_FIELDS, ({
+            "group_id": group.group_id, "normalized_merchant": group.normalized_merchant, "direction": group.direction,
+            "currencies": "|".join(group.currencies), "account_ids": "|".join(group.account_ids),
+            "transaction_count": str(group.transaction_count), "totals_by_currency": "|".join(f"{currency}:{amount}" for currency, amount in group.totals_by_currency),
+            "date_start": group.date_start, "date_end": group.date_end, "confidence": group.confidence,
+        } for group in groups))
+    hashes = {relative: hashlib.sha256(payload).hexdigest() for relative, payload in sorted(artifacts.items())}
+    manifest = resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json")
+    if manifest.exists():
+        hashes["work/import-manifest.json"] = sha256_file(manifest)
+    if record_validation:
+        input_hash = hashlib.sha256(json.dumps({
+            "balances": sha256_file(resolve_inside_ledger(ledger_root, Path("inputs") / "account-balances.csv")),
+            "rules": sha256_file(resolve_inside_ledger(ledger_root, "merchant-rules.csv")),
+            "transactions": sha256_file(resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv")) if resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv").exists() else "",
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        append_audit_event(ledger_root, "validation_completed", {"input_sha256": input_hash, "output_hashes": hashes, "state": state.value}, dedupe_key=f"validation_completed:{input_hash}:{hashlib.sha256(json.dumps(hashes, sort_keys=True).encode('utf-8')).hexdigest()}")
+    audit = resolve_inside_ledger(ledger_root, Path("audit") / "audit.jsonl")
+    if audit.exists():
+        hashes["audit/audit.jsonl"] = sha256_file(audit)
+    status = {
+        "blocking_issue_count": sum(issue.blocking for issue in all_issues), "has_transactions": bool(transactions),
+        "output_hashes": hashes, "pending_group_count": pending_group_count,
+        "reconciled_unit_count": sum(row.reconciled for row in rows), "state": state.value, "unit_count": len(rows),
+    }
+    artifacts["outputs/status.json"] = _json_bytes(status)
+    _install_output_bundle(ledger_root, artifacts)
     return status
