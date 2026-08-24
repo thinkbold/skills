@@ -156,7 +156,7 @@ def _record_import(
         ledger_root,
         event_type,
         {"source_hashes": hashes, "transaction_count": len(merged.transactions), "overlap_count": len(merged.duplicate_sources)},
-        dedupe_key=f"{event_type}:{source_hash}",
+        dedupe_key=f"{event_type}:{source_identity}:{source_hash}",
     )
     return {"status": "imported", "transaction_count": len(merged.transactions), "audit_event_id": event_id}
 
@@ -239,11 +239,19 @@ def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, ob
 
 
 def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
-    result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, args.result)
+    result_path = resolve_inside_ledger(ledger_root, args.result)
+    if not result_path.is_file():
+        raise ValueError("external result must be a real file inside the selected ledger")
+    result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, result_path)
     replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, result.issues)
     if result.issues:
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
-    return {"status": "admitted", "transaction_count": len(result.transactions)}
+    if len(result.source_hashes) != 1:
+        raise ValueError("external result did not identify one logical source")
+    source_identity = next(iter(result.source_hashes))
+    return _record_import(
+        ledger_root, source_identity, result, "external_result_import_recorded",
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

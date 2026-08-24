@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
+from io import StringIO
 import json
 from pathlib import Path
 import re
@@ -28,8 +29,8 @@ _NONCE = re.compile(r"^[0-9a-f]{32}$")
 _PAGE_LOCATION = re.compile(r"^page:([1-9][0-9]*)/row:([1-9][0-9]*)$")
 _FIELD_REQUIREMENTS = {
     "date": ("transaction_date", "posting_date"),
-    "description": ("raw_description",),
-    "amount": ("inflow", "outflow"),
+    "description": ("raw_description", "reference"),
+    "amount": ("inflow", "outflow", "running_balance"),
 }
 _REQUIRED_RESULT_FIELDS = frozenset({
     "transaction_id", "account_id", "currency", "transaction_date", "posting_date",
@@ -297,20 +298,24 @@ def _authorized_scope(ledger_root: Path, consent_id: str) -> _AuthorizedScope | 
     return scope
 
 
-def _canonical_rows(result_path: Path) -> tuple[tuple[dict[str, str], ...], ImportResult | None]:
+def _canonical_rows(result_path: Path) -> tuple[tuple[dict[str, str], ...], str, ImportResult | None]:
     try:
-        with Path(result_path).open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
-            if tuple(reader.fieldnames or ()) != CANONICAL_TRANSACTION_FIELDS:
-                return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result does not use the canonical transaction fields.")
-            rows = tuple(dict(row) for row in reader)
+        payload = Path(result_path).read_bytes()
+        reader = csv.DictReader(StringIO(payload.decode("utf-8-sig"), newline=""))
+        if tuple(reader.fieldnames or ()) != CANONICAL_TRANSACTION_FIELDS:
+            return (), "", _issue("EXTERNAL_RESULT_INVALID", "Returned result does not use the canonical transaction fields.")
+        rows = tuple(dict(row) for row in reader)
     except (OSError, csv.Error, UnicodeError):
-        return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result cannot be read as a local canonical CSV.")
+        return (), "", _issue("EXTERNAL_RESULT_INVALID", "Returned result cannot be read as a local canonical CSV.")
     if not rows:
-        return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result has no transaction rows.")
-    if any(not _valid_canonical_row(row) for row in rows):
-        return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result has malformed canonical transaction values.")
-    return rows, None
+        return (), "", _issue("EXTERNAL_RESULT_INVALID", "Returned result has no transaction rows.")
+    if any(
+        set(row) != set(CANONICAL_TRANSACTION_FIELDS)
+        or any(not isinstance(row.get(field), str) for field in CANONICAL_TRANSACTION_FIELDS)
+        for row in rows
+    ):
+        return (), "", _issue("EXTERNAL_RESULT_INVALID", "Returned result has malformed canonical transaction values.")
+    return rows, hashlib.sha256(payload).hexdigest(), None
 
 
 def _valid_iso_date(value: str) -> bool:
@@ -357,11 +362,19 @@ def _has_requested_fields(row: Mapping[str, str], fields: tuple[str, ...]) -> bo
                 inflow, outflow = Decimal(row["inflow"]), Decimal(row["outflow"])
             except (InvalidOperation, KeyError):
                 return False
-            if (inflow == 0) == (outflow == 0):
+            if not row.get("running_balance", "").strip() or (inflow == 0) == (outflow == 0):
                 return False
         elif any(not row.get(name, "").strip() for name in required):
             return False
     return True
+
+
+def _populated_statement_groups(row: Mapping[str, str]) -> set[str]:
+    return {
+        group
+        for group, names in _FIELD_REQUIREMENTS.items()
+        if any(row.get(name, "").strip() for name in names)
+    }
 
 
 def _result_scope_issue(rows: tuple[dict[str, str], ...], proposal: _AuthorizedScope) -> ImportResult | None:
@@ -370,17 +383,46 @@ def _result_scope_issue(rows: tuple[dict[str, str], ...], proposal: _AuthorizedS
         return _issue("EXTERNAL_RESULT_PROVIDER_MISMATCH", "Returned result does not identify the authorized provider.")
     pages: set[int] = set()
     for row in rows:
+        if _populated_statement_groups(row) != set(proposal.fields) or not _has_requested_fields(row, proposal.fields):
+            return _issue("EXTERNAL_SCOPE_MISMATCH", "Returned result does not match the authorized field set.")
         location = _PAGE_LOCATION.fullmatch(row.get("source_page_or_row", ""))
         if location is None:
             return _issue("EXTERNAL_RESULT_INVALID", "Returned result is missing page and row provenance.")
         pages.add(int(location.group(1)))
         if not row.get("source_file", "").strip() or not row.get("source_locations", "").strip():
             return _issue("EXTERNAL_RESULT_INVALID", "Returned result is missing source provenance.")
-        if not _has_requested_fields(row, proposal.fields):
-            return _issue("EXTERNAL_SCOPE_MISMATCH", "Returned result does not match the authorized field set.")
     if tuple(sorted(pages)) != proposal.pages:
         return _issue("EXTERNAL_SCOPE_MISMATCH", "Returned result does not match the authorized page set.")
     return None
+
+
+def _local_external_rows(
+    rows: tuple[dict[str, str], ...],
+    operation_id: str,
+    result_hash: str,
+) -> tuple[dict[str, str], ...]:
+    logical_source = f"external:{operation_id}"
+    sanitized = []
+    for ordinal, source in enumerate(rows, start=1):
+        row = dict(source)
+        id_basis = json.dumps({
+            "operation_id": operation_id,
+            "result_hash": result_hash,
+            "row_ordinal": ordinal,
+            "source_page_or_row": row["source_page_or_row"],
+        }, sort_keys=True, separators=(",", ":"))
+        row.update({
+            "transaction_id": hashlib.sha256(id_basis.encode("utf-8")).hexdigest(),
+            "source_file": logical_source,
+            "normalized_merchant": "",
+            "classification_status": "unclassified",
+            "account_code": "",
+            "account_name": "",
+            "rule_id": "",
+            "review_note": "",
+        })
+        sanitized.append(row)
+    return tuple(sanitized)
 
 
 def admit_external_result(
@@ -397,10 +439,16 @@ def admit_external_result(
         return _issue("EXTERNAL_NOT_AUTHORIZED", "The selected ledger has no current authorization for this operation.")
     if provider != proposal.provider or source_hash.lower() != proposal.source_hash:
         return _issue("EXTERNAL_SCOPE_MISMATCH", "Provider or source does not match the authorized operation.")
-    rows, invalid = _canonical_rows(result_path)
+    rows, result_hash, invalid = _canonical_rows(result_path)
     if invalid is not None:
         return invalid
     scope_issue = _result_scope_issue(rows, proposal)
     if scope_issue is not None:
         return scope_issue
-    return ImportResult(transactions=rows, source_hashes={f"external:{proposal.operation_id}": proposal.source_hash})
+    if any(not _valid_canonical_row(row) for row in rows):
+        return _issue("EXTERNAL_RESULT_INVALID", "Returned result has malformed canonical transaction values.")
+    logical_source = f"external:{proposal.operation_id}"
+    return ImportResult(
+        transactions=_local_external_rows(rows, proposal.operation_id, result_hash),
+        source_hashes={logical_source: result_hash},
+    )

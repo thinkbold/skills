@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import csv
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 from io import StringIO
 import json
 from pathlib import Path
@@ -26,7 +27,7 @@ from bookkeeper.consent import (
 )
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS
 from bookkeeper.ledger import initialize_ledger
-from bookkeeper.storage import read_audit_events
+from bookkeeper.storage import read_audit_events, read_csv_rows
 import import_statements
 
 
@@ -57,8 +58,11 @@ class ConsentTests(unittest.TestCase):
         self.directory.cleanup()
 
     def _authorize(self) -> str:
+        return self._authorize_proposal(self.proposal)
+
+    def _authorize_proposal(self, proposal) -> str:
         return record_external_decision(
-            self.ledger, self.proposal, True, "user",
+            self.ledger, proposal, True, "user",
             now=datetime(2026, 8, 24, tzinfo=timezone.utc),
         )
 
@@ -73,8 +77,24 @@ class ConsentTests(unittest.TestCase):
             writer.writerow(row)
         return path
 
-    def test_exact_authorization_admits_matching_local_result(self) -> None:
-        """Catches treating an exact authorized operation as blocked."""
+    def _run_external_result(self, result_path: Path, consent_id: str) -> tuple[int, dict[str, object]]:
+        output = StringIO()
+        with redirect_stdout(output):
+            return_code = import_statements.main([
+                "external-result", str(self.ledger), str(result_path), "--consent-id", consent_id,
+                "--provider", PROVIDER, "--source-hash", SOURCE_HASH,
+            ])
+        return return_code, json.loads(output.getvalue())
+
+    def _ledger_bytes(self) -> dict[str, bytes]:
+        return {
+            path.relative_to(self.ledger).as_posix(): path.read_bytes()
+            for path in sorted(self.ledger.rglob("*"))
+            if path.is_file()
+        }
+
+    def test_full_statement_data_scope_admits_matching_local_result(self) -> None:
+        """Catches blocking a canonical result authorized for every populated statement-data group."""
         consent_id = self._authorize()
 
         result = admit_external_result(
@@ -85,6 +105,50 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual((), result.issues)
         self.assertEqual("third_party:Synthetic OCR Provider", result.transactions[0]["extraction_method"])
         self.assertTrue(find_valid_authorization(self.ledger, consent_id, self.proposal))
+
+    def test_date_only_scope_rejects_a_full_canonical_result(self) -> None:
+        """Catches date-only authorization silently admitting populated descriptions and amounts."""
+        proposal = create_external_proposal(
+            provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date",),
+            sensitive_data=("dates",), retention_risk="Unknown.", training_risk="Unknown.",
+            regional_risk="Unknown.", redactions=("mask account header",),
+            manual_alternative="Enter the dates locally.",
+        )
+        consent_id = self._authorize_proposal(proposal)
+
+        result = admit_external_result(
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            FIXTURES / "external-result.csv",
+        )
+
+        self.assertEqual("EXTERNAL_SCOPE_MISMATCH", result.issues[0].code)
+
+    def test_full_scope_rejects_a_result_missing_the_description_group(self) -> None:
+        """Catches an authorized group being absent from a returned canonical row."""
+        consent_id = self._authorize()
+        result = admit_external_result(
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            self._write_result("missing-description-group.csv", {"raw_description": "", "reference": ""}),
+        )
+
+        self.assertEqual("EXTERNAL_SCOPE_MISMATCH", result.issues[0].code)
+
+    def test_result_rejects_a_populated_group_outside_current_authorization(self) -> None:
+        """Catches a populated description group escaping date-and-amount authorization."""
+        proposal = create_external_proposal(
+            provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date", "amount"),
+            sensitive_data=("dates", "amounts"), retention_risk="Unknown.", training_risk="Unknown.",
+            regional_risk="Unknown.", redactions=("mask account header",),
+            manual_alternative="Enter dates and amounts locally.",
+        )
+        consent_id = self._authorize_proposal(proposal)
+
+        result = admit_external_result(
+            self.ledger, consent_id, PROVIDER, SOURCE_HASH,
+            FIXTURES / "external-result.csv",
+        )
+
+        self.assertEqual("EXTERNAL_SCOPE_MISMATCH", result.issues[0].code)
 
     def test_persisted_scope_edit_with_retained_operation_id_is_rejected(self) -> None:
         """Catches trusting a format-valid operation ID after its provider/source/page/field scope changes."""
@@ -161,7 +225,7 @@ class ConsentTests(unittest.TestCase):
         )
 
         self.assertEqual("EXTERNAL_SCOPE_MISMATCH", page_result.issues[0].code)
-        self.assertEqual("EXTERNAL_RESULT_INVALID", fields_result.issues[0].code)
+        self.assertEqual("EXTERNAL_SCOPE_MISMATCH", fields_result.issues[0].code)
 
     def test_later_decline_invalidates_an_earlier_authorization_for_same_operation(self) -> None:
         """Catches using a stale approval after the recorded current decision has changed."""
@@ -294,13 +358,167 @@ class ConsentTests(unittest.TestCase):
         consent_record = json.loads(consent_output.getvalue())
         self.assertEqual(disclosed, consent_record["disclosure"])
         consent_id = consent_record["consent_id"]
+        returned = self.ledger / "work" / "external-result.csv"
+        returned.write_bytes((FIXTURES / "external-result.csv").read_bytes())
         result_output = StringIO()
         with redirect_stdout(result_output):
             self.assertEqual(0, import_statements.main([
-                "external-result", str(self.ledger), str(FIXTURES / "external-result.csv"), "--consent-id", consent_id,
+                "external-result", str(self.ledger), str(returned), "--consent-id", consent_id,
                 "--provider", PROVIDER, "--source-hash", SOURCE_HASH,
             ]))
-        self.assertEqual("admitted", json.loads(result_output.getvalue())["status"])
+        self.assertEqual("imported", json.loads(result_output.getvalue())["status"])
+
+    def test_cli_imports_external_rows_through_canonical_manifest_outputs_and_audit(self) -> None:
+        """Catches admitting provider rows without persisting sanitized workflow state."""
+        consent_id = self._authorize()
+        returned = self._write_result("classified-provider-result.csv", {
+            "transaction_id": "provider-controlled-id",
+            "normalized_merchant": "PROVIDER MERCHANT",
+            "classification_status": "classified",
+            "account_code": "9999",
+            "account_name": "Provider Category",
+            "rule_id": "provider-rule",
+            "review_note": "provider-reviewed",
+        })
+        returned_hash = hashlib.sha256(returned.read_bytes()).hexdigest()
+        logical_source = f"external:{self.proposal.operation_id}"
+        id_basis = json.dumps({
+            "operation_id": self.proposal.operation_id,
+            "result_hash": returned_hash,
+            "row_ordinal": 1,
+            "source_page_or_row": "page:2/row:1",
+        }, sort_keys=True, separators=(",", ":"))
+        expected_id = hashlib.sha256(id_basis.encode("utf-8")).hexdigest()
+
+        return_code, output = self._run_external_result(returned, consent_id)
+
+        self.assertEqual(0, return_code)
+        self.assertEqual("imported", output["status"])
+        canonical = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+        self.assertEqual(1, len(canonical))
+        row = canonical[0]
+        self.assertEqual(expected_id, row["transaction_id"])
+        self.assertEqual(logical_source, row["source_file"])
+        self.assertEqual("page:2/row:1", row["source_page_or_row"])
+        self.assertEqual("inputs/synthetic.pdf:page:2/row:1", row["source_locations"])
+        self.assertEqual("SYNTHETIC MERCHANT", row["normalized_merchant"])
+        self.assertEqual("unclassified", row["classification_status"])
+        self.assertEqual(("", "", "", ""), tuple(row[field] for field in (
+            "account_code", "account_name", "rule_id", "review_note",
+        )))
+        manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual({logical_source: returned_hash}, manifest["source_hashes"])
+        self.assertEqual(1, manifest["transaction_count"])
+        self.assertEqual(1, len(read_csv_rows(self.ledger / "outputs" / "normalized-transactions.csv")))
+        self.assertEqual(1, len(read_csv_rows(self.ledger / "outputs" / "classified-transactions.csv")))
+        self.assertTrue((self.ledger / "outputs" / "status.json").is_file())
+        imported_events = [
+            event for event in read_audit_events(self.ledger)
+            if event["event_type"] == "external_result_import_recorded"
+        ]
+        self.assertEqual(1, len(imported_events))
+        self.assertEqual(returned_hash, imported_events[0]["payload"]["source_hashes"][logical_source])
+        consent_events = [
+            event for event in read_audit_events(self.ledger)
+            if event["event_type"] == "external_processing_consent_decision"
+        ]
+        self.assertEqual(SOURCE_HASH, consent_events[0]["payload"]["source_hash"])
+
+    def test_cli_external_result_rerun_is_byte_event_and_row_idempotent(self) -> None:
+        """Catches a repeated admitted result changing bytes, IDs, rows, or audit events."""
+        consent_id = self._authorize()
+        returned = self._write_result("stable-result.csv", {})
+
+        first_code, first_output = self._run_external_result(returned, consent_id)
+        first_bytes = self._ledger_bytes()
+        first_rows = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+        first_events = read_audit_events(self.ledger)
+        second_code, second_output = self._run_external_result(returned, consent_id)
+
+        self.assertEqual((0, 0), (first_code, second_code))
+        self.assertEqual(first_output["audit_event_id"], second_output["audit_event_id"])
+        self.assertEqual(first_bytes, self._ledger_bytes())
+        self.assertEqual(first_rows, read_csv_rows(self.ledger / "work" / "normalized-transactions.csv"))
+        self.assertEqual(first_events, read_audit_events(self.ledger))
+
+    def test_cli_changed_external_bytes_replace_one_operation_without_stale_rows(self) -> None:
+        """Catches changed returned bytes appending beside the prior contribution for one operation."""
+        consent_id = self._authorize()
+        returned = self._write_result("changing-result.csv", {})
+        first_hash = hashlib.sha256(returned.read_bytes()).hexdigest()
+        first_code, _ = self._run_external_result(returned, consent_id)
+        first_id = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")[0]["transaction_id"]
+        self._write_result("changing-result.csv", {
+            "raw_description": "Changed synthetic merchant", "reference": "SYN-2", "outflow": "25.00",
+        })
+        second_hash = hashlib.sha256(returned.read_bytes()).hexdigest()
+
+        second_code, _ = self._run_external_result(returned, consent_id)
+
+        self.assertEqual((0, 0), (first_code, second_code))
+        self.assertNotEqual(first_hash, second_hash)
+        rows = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+        self.assertEqual(1, len(rows))
+        self.assertEqual("Changed synthetic merchant", rows[0]["raw_description"])
+        self.assertNotEqual(first_id, rows[0]["transaction_id"])
+        logical_source = f"external:{self.proposal.operation_id}"
+        manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual({logical_source: second_hash}, manifest["source_hashes"])
+        imported_events = [
+            event for event in read_audit_events(self.ledger)
+            if event["event_type"] == "external_result_import_recorded"
+        ]
+        self.assertEqual(2, len(imported_events))
+
+    def test_cli_same_external_bytes_for_distinct_operations_are_independently_audited(self) -> None:
+        """Catches equal returned bytes coalescing two independently authorized operations."""
+        first_id = self._authorize()
+        second_proposal = create_external_proposal(
+            provider=PROVIDER, source_hash=SOURCE_HASH, pages=(2,), fields=("date", "description", "amount"),
+            sensitive_data=("descriptions", "amounts"), retention_risk="Unknown.", training_risk="Unknown.",
+            regional_risk="Unknown.", redactions=("mask account header",),
+            manual_alternative="Enter page 2 locally.",
+        )
+        second_id = self._authorize_proposal(second_proposal)
+        returned = self._write_result("shared-result.csv", {})
+        returned_hash = hashlib.sha256(returned.read_bytes()).hexdigest()
+
+        first_code, first_output = self._run_external_result(returned, first_id)
+        second_code, second_output = self._run_external_result(returned, second_id)
+
+        self.assertEqual((0, 0), (first_code, second_code))
+        self.assertNotEqual(first_output["audit_event_id"], second_output["audit_event_id"])
+        manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual({
+            f"external:{self.proposal.operation_id}": returned_hash,
+            f"external:{second_proposal.operation_id}": returned_hash,
+        }, manifest["source_hashes"])
+        imported_events = [
+            event for event in read_audit_events(self.ledger)
+            if event["event_type"] == "external_result_import_recorded"
+        ]
+        self.assertEqual(2, len(imported_events))
+        self.assertEqual(2, len({event["dedupe_key"] for event in imported_events}))
+        self.assertEqual(1, len(read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")))
+        self.assertEqual(1, imported_events[-1]["payload"]["overlap_count"])
+
+    def test_cli_rejects_outside_and_cross_ledger_results_without_target_mutation(self) -> None:
+        """Catches a result path escaping the selected ledger before admission persistence."""
+        consent_id = self._authorize()
+        other_ledger = Path(self.directory.name) / "other-ledger"
+        initialize_ledger(other_ledger, "other", "Other", "CAD", None)
+        cross_ledger = other_ledger / "work" / "result.csv"
+        cross_ledger.write_bytes((FIXTURES / "external-result.csv").read_bytes())
+        outside = Path(self.directory.name) / "outside.csv"
+        outside.write_bytes((FIXTURES / "external-result.csv").read_bytes())
+        expected = self._ledger_bytes()
+
+        for result_path in (outside, cross_ledger):
+            with self.subTest(result_path=result_path.name):
+                return_code, output = self._run_external_result(result_path, consent_id)
+                self.assertEqual(3, return_code)
+                self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+                self.assertEqual(expected, self._ledger_bytes())
 
 
 if __name__ == "__main__":
