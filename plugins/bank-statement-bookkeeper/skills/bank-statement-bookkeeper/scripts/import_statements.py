@@ -30,6 +30,7 @@ from bookkeeper.importing import (
     AccountCandidate,
     CsvMapping,
     StatementInventory,
+    account_context_issue,
     apply_manual_correction,
     discover_account_candidates,
     merge_import_results,
@@ -94,6 +95,13 @@ def _account(payload: dict[str, object]) -> AccountContext:
     if missing:
         raise ValueError(f"account confirmation missing fields: {', '.join(missing)}")
     return AccountContext(**{field: str(payload[field]) for field in fields})
+
+
+def _confirmed_account(payload: dict[str, object]) -> AccountContext:
+    account = _account(payload)
+    if account_context_issue(account) is not None:
+        raise ValueError("account context is not confirmed and masked")
+    return account
 
 
 def _manifest(ledger_root: Path) -> dict[str, object]:
@@ -688,8 +696,11 @@ def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, ob
 
 def _external_result(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
     selected_root = Path(os.path.abspath(os.fspath(args.ledger_dir)))
+    account = _confirmed_account(_read_ledger_json(ledger_root, args.account))
     result_path = _ledger_external_result(ledger_root, selected_root, args.result)
-    result = admit_external_result(ledger_root, args.consent_id, args.provider, args.source_hash, result_path)
+    result = admit_external_result(
+        ledger_root, args.consent_id, args.provider, args.source_hash, account, result_path,
+    )
     if result.issues:
         _current_contributions(ledger_root, _manifest(ledger_root))
         replace_active_issues(ledger_root, "external_result", {"provider": args.provider, "source_hash": args.source_hash}, result.issues)
@@ -741,6 +752,7 @@ def _parser() -> argparse.ArgumentParser:
     external_result.add_argument("--consent-id", required=True)
     external_result.add_argument("--provider", required=True)
     external_result.add_argument("--source-hash", required=True)
+    external_result.add_argument("--account", required=True)
     return parser
 
 
@@ -789,7 +801,14 @@ def main(argv: list[str] | None = None) -> int:
             output = _external_result(ledger_root, args)
         else:
             output = _correct_row(ledger_root, args)
-        publish_derived_outputs(ledger_root)
+        publish_derived_outputs(
+            ledger_root,
+            update_canonical=not (
+                args.command == "external-result"
+                and output.get("status") == "blocked"
+                and "EXTERNAL_ACCOUNT_MISMATCH" in output.get("issues", [])
+            ),
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         print(json.dumps({"error": "LEDGER_SCHEMA_INVALID"}, sort_keys=True))
         return 3

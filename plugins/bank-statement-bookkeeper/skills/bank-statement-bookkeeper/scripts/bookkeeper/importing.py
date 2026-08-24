@@ -98,8 +98,11 @@ def _parse_date(value: str, formats: tuple[str, ...]) -> str:
     raise ValueError(f"unparseable date: {value}")
 
 
-def _account_issue(account: AccountContext) -> Issue | None:
-    if not all((account.account_id, account.institution, account.masked_label, account.currency)):
+def account_context_issue(account: AccountContext) -> Issue | None:
+    """Return a blocking issue unless every account field is confirmed and the label is masked."""
+    if not all(value.strip() for value in (
+        account.account_id, account.institution, account.masked_label, account.currency,
+    )):
         return Issue("ACCOUNT_UNCONFIRMED", "A confirmed account context is required.")
     if not _MASKED_LABEL.fullmatch(account.masked_label):
         return Issue("ACCOUNT_UNCONFIRMED", "Account labels must be explicitly masked before import.")
@@ -188,7 +191,7 @@ def normalize_csv_statement(
             issues=(Issue("CURRENCY_MISSING", "A currency is required for each import.", logical_source),),
             source_hashes={logical_source: source_hash},
         )
-    account_issue = _account_issue(account)
+    account_issue = account_context_issue(account)
     if account_issue is not None:
         return ImportResult(issues=(account_issue,), source_hashes={logical_source: source_hash})
     with source.open("r", encoding="utf-8-sig", newline="") as handle:

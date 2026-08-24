@@ -787,7 +787,12 @@ def _install_output_bundle(ledger_root: Path, artifacts: Mapping[str, bytes]) ->
         raise
 
 
-def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = False) -> dict[str, object]:
+def publish_derived_outputs(
+    ledger_root: Path,
+    *,
+    record_validation: bool = False,
+    update_canonical: bool = True,
+) -> dict[str, object]:
     """Publish one complete deterministic ledger-local view, recovering an old view first."""
     recover_pending_output_bundle(ledger_root)
     from .classification import apply_exact_rules, load_rules
@@ -796,7 +801,7 @@ def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = Fals
     valid_transactions, canonical_issues = admit_canonical_transactions(transactions)
     classified = apply_exact_rules(valid_transactions, load_rules(ledger_root))
     classified_rows = _ordered_transactions(classified.transactions)
-    if not canonical_load_issues and not canonical_issues and len(classified_rows) == len(transactions):
+    if update_canonical and not canonical_load_issues and not canonical_issues and len(classified_rows) == len(transactions):
         atomic_write_csv(resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv"), CANONICAL_TRANSACTION_FIELDS, classified.transactions)
     from .storage import replace_active_issues
     replace_active_issues(ledger_root, "classification", {"view": "current"}, classified.issues)

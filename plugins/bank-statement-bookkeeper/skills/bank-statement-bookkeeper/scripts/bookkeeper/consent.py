@@ -19,7 +19,8 @@ import re
 from typing import Mapping
 from uuid import uuid4
 
-from .contracts import CANONICAL_TRANSACTION_FIELDS, ImportResult, Issue
+from .contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult, Issue
+from .importing import account_context_issue
 from .storage import append_audit_event, read_audit_events
 
 
@@ -400,6 +401,7 @@ def _local_external_rows(
     rows: tuple[dict[str, str], ...],
     operation_id: str,
     result_hash: str,
+    account: AccountContext,
 ) -> tuple[dict[str, str], ...]:
     logical_source = f"external:{operation_id}"
     sanitized = []
@@ -413,6 +415,8 @@ def _local_external_rows(
         }, sort_keys=True, separators=(",", ":"))
         row.update({
             "transaction_id": hashlib.sha256(id_basis.encode("utf-8")).hexdigest(),
+            "account_id": account.account_id,
+            "currency": account.currency,
             "source_file": logical_source,
             "source_locations": "|".join(
                 f"{logical_source}:{location}"
@@ -435,6 +439,7 @@ def admit_external_result(
     consent_id: str,
     provider: str,
     source_hash: str,
+    account: AccountContext,
     result_path: Path,
 ) -> ImportResult:
     """Validate a local returned CSV; this function never uploads or calls a provider."""
@@ -444,6 +449,9 @@ def admit_external_result(
         return _issue("EXTERNAL_NOT_AUTHORIZED", "The selected ledger has no current authorization for this operation.")
     if provider != proposal.provider or source_hash.lower() != proposal.source_hash:
         return _issue("EXTERNAL_SCOPE_MISMATCH", "Provider or source does not match the authorized operation.")
+    account_issue = account_context_issue(account)
+    if account_issue is not None:
+        return ImportResult(issues=(account_issue,))
     rows, result_hash, invalid = _canonical_rows(result_path)
     if invalid is not None:
         return invalid
@@ -452,8 +460,13 @@ def admit_external_result(
         return scope_issue
     if any(not _valid_canonical_row(row) for row in rows):
         return _issue("EXTERNAL_RESULT_INVALID", "Returned result has malformed canonical transaction values.")
+    if any(row["account_id"] != account.account_id or row["currency"] != account.currency for row in rows):
+        return _issue(
+            "EXTERNAL_ACCOUNT_MISMATCH",
+            "Returned result does not match the confirmed local account and currency.",
+        )
     logical_source = f"external:{proposal.operation_id}"
     return ImportResult(
-        transactions=_local_external_rows(rows, proposal.operation_id, result_hash),
+        transactions=_local_external_rows(rows, proposal.operation_id, result_hash, account),
         source_hashes={logical_source: result_hash},
     )
