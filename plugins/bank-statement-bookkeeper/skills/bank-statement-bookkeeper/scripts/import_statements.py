@@ -17,6 +17,7 @@ from bookkeeper.importing import (
     discover_account_candidates,
     merge_import_results,
     normalize_csv_statement,
+    recover_pending_correction,
 )
 from bookkeeper.ledger import load_ledger
 from bookkeeper.storage import (
@@ -75,7 +76,15 @@ def _manifest(ledger_root: Path) -> dict[str, object]:
     return loaded
 
 
-def _candidate_from_csv(source: Path) -> StatementInventory:
+def _ledger_input(ledger_root: Path, requested: Path) -> tuple[Path, str]:
+    source = resolve_inside_ledger(ledger_root, requested)
+    inputs_root = resolve_inside_ledger(ledger_root, "inputs")
+    if not source.is_file() or not source.is_relative_to(inputs_root):
+        raise ValueError("statement files must be ledger-relative paths inside inputs/")
+    return source, source.relative_to(ledger_root).as_posix()
+
+
+def _candidate_from_csv(source: Path, source_identity: str) -> StatementInventory:
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
         first = next(csv.DictReader(handle), {})
     institution = str(first.get("Institution") or first.get("Bank") or "")
@@ -83,7 +92,7 @@ def _candidate_from_csv(source: Path) -> StatementInventory:
     currency = str(first.get("Currency") or "")
     masked = account if "*" in account else (mask_account_label(account) if account else "")
     confidence = "high" if all((institution, masked, currency)) else "low"
-    return StatementInventory(source.name, institution, masked, currency, confidence)
+    return StatementInventory(source_identity, institution, masked, currency, confidence)
 
 
 def _candidate_summary(candidate: AccountCandidate) -> dict[str, object]:
@@ -97,19 +106,26 @@ def _candidate_summary(candidate: AccountCandidate) -> dict[str, object]:
     }
 
 
-def _write_import(ledger_root: Path, source: Path, mapping: CsvMapping, account: AccountContext) -> dict[str, object]:
-    result = normalize_csv_statement(source, mapping, account)
+def _write_import(
+    ledger_root: Path,
+    source: Path,
+    source_identity: str,
+    mapping: CsvMapping,
+    account: AccountContext,
+) -> dict[str, object]:
+    result = normalize_csv_statement(source, mapping, account, source_identity)
     if result.issues:
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
     manifest = _manifest(ledger_root)
     previous_hashes = dict(manifest.get("source_hashes", {}))
-    source_hash = result.source_hashes[source.name]
-    canonical_path = resolve_inside_ledger(ledger_root, Path("inputs") / "canonical-transactions.csv")
+    source_hash = result.source_hashes[source_identity]
+    canonical_path = resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv")
     existing = tuple(read_csv_rows(canonical_path)) if canonical_path.exists() else ()
-    if previous_hashes.get(source.name) == source_hash:
+    if previous_hashes.get(source_identity) == source_hash:
         merged = ImportResult(transactions=existing, source_hashes=previous_hashes)
     else:
-        merged = merge_import_results((ImportResult(transactions=existing, source_hashes=previous_hashes), result))
+        retained = tuple(row for row in existing if row["source_file"] != source_identity)
+        merged = merge_import_results((ImportResult(transactions=retained, source_hashes=previous_hashes), result))
     atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, merged.transactions)
     hashes = {**previous_hashes, **result.source_hashes}
     atomic_write_json(resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json"), {
@@ -126,14 +142,14 @@ def _write_import(ledger_root: Path, source: Path, mapping: CsvMapping, account:
 
 
 def _correct_row(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
-    canonical_path = resolve_inside_ledger(ledger_root, Path("inputs") / "canonical-transactions.csv")
+    recover_pending_correction(ledger_root)
+    canonical_path = resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv")
     if not canonical_path.is_file():
         raise ValueError("canonical transaction CSV does not exist")
     corrected = apply_manual_correction(
         ledger_root, tuple(read_csv_rows(canonical_path)), args.transaction_id, args.field,
         args.value, args.reason, args.actor,
     )
-    atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, corrected)
     corrected_row = next(row for row in corrected if row["transaction_id"] == args.transaction_id)
     return {"status": "corrected", "transaction_id": args.transaction_id, "audit_event_id": corrected_row["review_note"]}
 
@@ -164,16 +180,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ledger_root = args.ledger_dir.resolve()
         load_ledger(ledger_root)
+        recover_pending_correction(ledger_root)
         if args.command == "inventory":
-            candidates = discover_account_candidates(tuple(_candidate_from_csv(path) for path in args.inputs))
+            inputs = tuple(_ledger_input(ledger_root, path) for path in args.inputs)
+            candidates = discover_account_candidates(tuple(
+                _candidate_from_csv(source, identity) for source, identity in inputs
+            ))
             output: dict[str, object] = {
                 "candidate_count": len(candidates),
                 "candidates": [_candidate_summary(candidate) for candidate in candidates],
                 "status": "confirmation_required",
             }
         elif args.command == "csv":
+            source, source_identity = _ledger_input(ledger_root, args.statement)
             output = _write_import(
-                ledger_root, args.statement, _mapping(_read_ledger_json(ledger_root, args.mapping)),
+                ledger_root, source, source_identity, _mapping(_read_ledger_json(ledger_root, args.mapping)),
                 _account(_read_ledger_json(ledger_root, args.account)),
             )
         else:

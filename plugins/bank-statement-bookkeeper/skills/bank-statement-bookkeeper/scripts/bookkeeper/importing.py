@@ -12,9 +12,10 @@ import os
 from pathlib import Path
 import re
 from typing import Iterable
+from uuid import uuid4
 
 from .contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult, Issue
-from .storage import append_audit_event, resolve_inside_ledger, sha256_file
+from .storage import append_audit_event, atomic_write_csv, atomic_write_json, resolve_inside_ledger, sha256_file
 
 
 _MONEY_FIELDS = frozenset({"inflow", "outflow", "running_balance"})
@@ -28,6 +29,12 @@ _EDITABLE_FIELDS = frozenset({
     "account_name", "rule_id",
 })
 _MASKED_LABEL = re.compile(r"^\*+[^\d]*\d{4}$")
+
+
+class _AmountError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -108,6 +115,7 @@ def _mapping_headers(mapping: CsvMapping) -> tuple[str, ...]:
 
 def _canonical_row(
     source: Path,
+    source_identity: str,
     source_hash: str,
     source_row: int,
     raw: dict[str, str],
@@ -118,13 +126,28 @@ def _canonical_row(
     posting_date = transaction_date
     if mapping.posting_date and raw.get(mapping.posting_date, "").strip():
         posting_date = _parse_date(raw[mapping.posting_date], mapping.date_formats)
-    debit = abs(parse_decimal(raw.get(mapping.debit, ""))) if mapping.debit else Decimal("0")
-    credit = abs(parse_decimal(raw.get(mapping.credit, ""))) if mapping.credit else Decimal("0")
+    debit_text = raw.get(mapping.debit, "") if mapping.debit else ""
+    credit_text = raw.get(mapping.credit, "") if mapping.credit else ""
+    if not str(debit_text).strip() and not str(credit_text).strip():
+        raise _AmountError("AMOUNT_MISSING", "A debit or credit amount is required.")
+    try:
+        debit = abs(parse_decimal(debit_text)) if str(debit_text).strip() else Decimal("0")
+        credit = abs(parse_decimal(credit_text)) if str(credit_text).strip() else Decimal("0")
+    except ValueError as error:
+        raise _AmountError("AMOUNT_UNPARSEABLE", str(error)) from error
     if debit and credit:
-        raise ValueError("simultaneous debit and credit")
-    balance = parse_decimal(raw.get(mapping.balance, "")) if mapping.balance else Decimal("0")
-    transaction_id = hashlib.sha256(f"{source_hash}:{source_row}".encode("utf-8")).hexdigest()
-    location = f"{source.name}:{source_row}"
+        raise _AmountError("AMOUNT_DIRECTION_AMBIGUOUS", "simultaneous debit and credit")
+    if not debit and not credit:
+        raise _AmountError("AMOUNT_ZERO", "A transaction amount cannot be zero.")
+    balance_text = raw.get(mapping.balance, "") if mapping.balance else ""
+    if not str(balance_text).strip():
+        raise _AmountError("AMOUNT_MISSING", "A running balance amount is required.")
+    try:
+        balance = parse_decimal(balance_text)
+    except ValueError as error:
+        raise _AmountError("AMOUNT_UNPARSEABLE", str(error)) from error
+    transaction_id = hashlib.sha256(f"{source_identity}:{source_hash}:{source_row}".encode("utf-8")).hexdigest()
+    location = f"{source_identity}:{source_row}"
     return {
         "transaction_id": transaction_id,
         "account_id": account.account_id,
@@ -137,7 +160,7 @@ def _canonical_row(
         "outflow": serialize_decimal(debit),
         "running_balance": serialize_decimal(balance),
         "reference": raw.get(mapping.reference, "") if mapping.reference else "",
-        "source_file": source.name,
+        "source_file": source_identity,
         "source_page_or_row": str(source_row),
         "extraction_method": "csv",
         "extraction_confidence": "high",
@@ -150,38 +173,45 @@ def _canonical_row(
     }
 
 
-def normalize_csv_statement(source: Path, mapping: CsvMapping, account: AccountContext) -> ImportResult:
+def normalize_csv_statement(
+    source: Path,
+    mapping: CsvMapping,
+    account: AccountContext,
+    source_identity: str | None = None,
+) -> ImportResult:
     """Return canonical rows or blocking issues without making format guesses."""
     source = Path(source)
     source_hash = sha256_file(source)
+    logical_source = source_identity or source.name
     if not account.currency.strip():
         return ImportResult(
-            issues=(Issue("CURRENCY_MISSING", "A currency is required for each import.", source.name),),
-            source_hashes={source.name: source_hash},
+            issues=(Issue("CURRENCY_MISSING", "A currency is required for each import.", logical_source),),
+            source_hashes={logical_source: source_hash},
         )
     account_issue = _account_issue(account)
     if account_issue is not None:
-        return ImportResult(issues=(account_issue,), source_hashes={source.name: source_hash})
+        return ImportResult(issues=(account_issue,), source_hashes={logical_source: source_hash})
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = tuple(reader.fieldnames or ())
         missing = [header for header in _mapping_headers(mapping) if header not in fieldnames]
         if missing:
             return ImportResult(
-                issues=(Issue("CSV_HEADER_MISSING", f"CSV header missing: {', '.join(missing)}", source.name),),
-                source_hashes={source.name: source_hash},
+                issues=(Issue("CSV_HEADER_MISSING", f"CSV header missing: {', '.join(missing)}", logical_source),),
+                source_hashes={logical_source: source_hash},
             )
         rows: list[dict[str, str]] = []
         issues: list[Issue] = []
         for source_row, raw in enumerate(reader, start=2):
             try:
-                rows.append(_canonical_row(source, source_hash, source_row, raw, mapping, account))
+                rows.append(_canonical_row(source, logical_source, source_hash, source_row, raw, mapping, account))
+            except _AmountError as error:
+                issues.append(Issue(error.code, str(error), logical_source, str(source_row)))
             except ValueError as error:
-                code = "AMOUNT_DIRECTION_AMBIGUOUS" if "simultaneous debit and credit" in str(error) else "DATE_UNPARSEABLE"
-                issues.append(Issue(code, str(error), source.name, str(source_row)))
+                issues.append(Issue("DATE_UNPARSEABLE", str(error), logical_source, str(source_row)))
         if issues:
-            return ImportResult(issues=tuple(issues), source_hashes={source.name: source_hash})
-    return ImportResult(transactions=tuple(rows), source_hashes={source.name: source_hash})
+            return ImportResult(issues=tuple(issues), source_hashes={logical_source: source_hash})
+    return ImportResult(transactions=tuple(rows), source_hashes={logical_source: source_hash})
 
 
 def discover_account_candidates(inventories: tuple[StatementInventory, ...]) -> tuple[AccountCandidate, ...]:
@@ -276,6 +306,11 @@ def _correction_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+_CANONICAL_RELATIVE_PATH = Path("work") / "normalized-transactions.csv"
+_PENDING_CORRECTION_RELATIVE_PATH = Path("work") / "pending-correction.json"
+_STAGED_CORRECTION_RELATIVE_PATH = Path("work") / "pending-correction.csv"
+
+
 def _append_correction(ledger_root: Path, event: dict[str, str]) -> None:
     path = resolve_inside_ledger(ledger_root, Path("work") / "corrections.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,6 +318,17 @@ def _append_correction(ledger_root: Path, event: dict[str, str]) -> None:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _correction_recorded(ledger_root: Path, event_id: str) -> bool:
+    path = resolve_inside_ledger(ledger_root, Path("work") / "corrections.jsonl")
+    if not path.exists():
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        return any(
+            isinstance(record, dict) and record.get("event_id") == event_id
+            for record in (json.loads(line) for line in handle if line.strip())
+        )
 
 
 def _validate_correction(field_name: str, corrected_value: str, row: dict[str, str]) -> str:
@@ -305,6 +351,112 @@ def _validate_correction(field_name: str, corrected_value: str, row: dict[str, s
     return corrected_value
 
 
+def _corrected_rows(
+    transactions: tuple[dict[str, str], ...],
+    transaction_id: str,
+    field_name: str,
+    corrected_value: str,
+    event_id: str,
+) -> tuple[dict[str, str], ...]:
+    output: list[dict[str, str]] = []
+    for row in transactions:
+        revised = dict(row)
+        if row.get("transaction_id") == transaction_id:
+            revised[field_name] = corrected_value
+            revised["review_note"] = event_id
+        output.append(revised)
+    return tuple(output)
+
+
+def stage_manual_correction(
+    ledger_root: Path,
+    transactions: tuple[dict[str, str], ...],
+    transaction_id: str,
+    field_name: str,
+    corrected_value: str,
+    reason: str,
+    actor: str,
+) -> tuple[dict[str, str], ...]:
+    """Stage one correction in a recoverable journal without changing canonical rows."""
+    recover_pending_correction(ledger_root)
+    if not reason.strip() or not actor.strip():
+        raise ValueError("a correction reason and actor are required")
+    matches = [row for row in transactions if row.get("transaction_id") == transaction_id]
+    if len(matches) != 1:
+        raise ValueError("transaction ID must identify exactly one row")
+    original = matches[0]
+    corrected = _validate_correction(field_name, corrected_value, original)
+    event_id = uuid4().hex
+    output = _corrected_rows(transactions, transaction_id, field_name, corrected, event_id)
+    correction_record = {
+        "actor": actor,
+        "corrected_value": corrected,
+        "event_id": event_id,
+        "field_name": field_name,
+        "original_value": original[field_name],
+        "reason": reason,
+        "timestamp": _correction_timestamp(),
+        "transaction_id": transaction_id,
+    }
+    staged_path = resolve_inside_ledger(ledger_root, _STAGED_CORRECTION_RELATIVE_PATH)
+    atomic_write_csv(staged_path, CANONICAL_TRANSACTION_FIELDS, output)
+    journal = {
+        "audit_payload": {
+            "corrected_value_sha256": hashlib.sha256(corrected.encode("utf-8")).hexdigest(),
+            "field_name": field_name,
+            "original_value_sha256": hashlib.sha256(original[field_name].encode("utf-8")).hexdigest(),
+            "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            "transaction_id": transaction_id,
+        },
+        "canonical_relative_path": str(_CANONICAL_RELATIVE_PATH),
+        "correction_record": correction_record,
+        "event_id": event_id,
+        "expected_canonical_sha256": sha256_file(staged_path),
+        "staged_relative_path": str(_STAGED_CORRECTION_RELATIVE_PATH),
+    }
+    atomic_write_json(resolve_inside_ledger(ledger_root, _PENDING_CORRECTION_RELATIVE_PATH), journal)
+    return output
+
+
+def recover_pending_correction(ledger_root: Path) -> None:
+    """Finish a journaled correction exactly once after a process interruption."""
+    journal_path = resolve_inside_ledger(ledger_root, _PENDING_CORRECTION_RELATIVE_PATH)
+    if not journal_path.exists():
+        return
+    with journal_path.open("r", encoding="utf-8") as handle:
+        journal = json.load(handle)
+    if not isinstance(journal, dict):
+        raise ValueError("pending correction journal is invalid")
+    required = {
+        "audit_payload", "canonical_relative_path", "correction_record", "event_id",
+        "expected_canonical_sha256", "staged_relative_path",
+    }
+    if set(journal) != required or not isinstance(journal["audit_payload"], dict) or not isinstance(journal["correction_record"], dict):
+        raise ValueError("pending correction journal is invalid")
+    canonical_path = resolve_inside_ledger(ledger_root, str(journal["canonical_relative_path"]))
+    staged_path = resolve_inside_ledger(ledger_root, str(journal["staged_relative_path"]))
+    expected_hash = str(journal["expected_canonical_sha256"])
+    canonical_matches = canonical_path.exists() and sha256_file(canonical_path) == expected_hash
+    if not canonical_matches:
+        if not staged_path.exists() or sha256_file(staged_path) != expected_hash:
+            raise ValueError("pending correction cannot safely recover canonical rows")
+        os.replace(staged_path, canonical_path)
+    event_id = append_audit_event(
+        ledger_root,
+        "manual_correction_recorded",
+        dict(journal["audit_payload"]),
+        actor=str(journal["correction_record"].get("actor", "user")),
+        dedupe_key=f"manual-correction:{journal['event_id']}",
+        event_id=str(journal["event_id"]),
+    )
+    if event_id != journal["event_id"]:
+        raise ValueError("pending correction audit event does not match its journal")
+    correction_record = {str(key): str(value) for key, value in journal["correction_record"].items()}
+    if not _correction_recorded(ledger_root, event_id):
+        _append_correction(ledger_root, correction_record)
+    journal_path.unlink()
+
+
 def apply_manual_correction(
     ledger_root: Path,
     transactions: tuple[dict[str, str], ...],
@@ -314,44 +466,12 @@ def apply_manual_correction(
     reason: str,
     actor: str,
 ) -> tuple[dict[str, str], ...]:
-    """Return corrected rows after recording original and corrected values."""
-    if not reason.strip() or not actor.strip():
-        raise ValueError("a correction reason and actor are required")
-    matches = [row for row in transactions if row.get("transaction_id") == transaction_id]
-    if len(matches) != 1:
-        raise ValueError("transaction ID must identify exactly one row")
-    original = matches[0]
-    corrected = _validate_correction(field_name, corrected_value, original)
-    event_id = append_audit_event(
-        ledger_root,
-        "manual_correction_recorded",
-        {
-            "transaction_id": transaction_id,
-            "field_name": field_name,
-            "reason_sha256": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
-            "original_value_sha256": hashlib.sha256(original[field_name].encode("utf-8")).hexdigest(),
-            "corrected_value_sha256": hashlib.sha256(corrected.encode("utf-8")).hexdigest(),
-        },
-        actor=actor,
+    """Persist a correction through a pending journal and return its corrected rows."""
+    output = stage_manual_correction(
+        ledger_root, transactions, transaction_id, field_name, corrected_value, reason, actor,
     )
-    _append_correction(ledger_root, {
-        "actor": actor,
-        "corrected_value": corrected,
-        "event_id": event_id,
-        "field_name": field_name,
-        "original_value": original[field_name],
-        "reason": reason,
-        "timestamp": _correction_timestamp(),
-        "transaction_id": transaction_id,
-    })
-    output: list[dict[str, str]] = []
-    for row in transactions:
-        revised = dict(row)
-        if row.get("transaction_id") == transaction_id:
-            revised[field_name] = corrected
-            revised["review_note"] = event_id
-        output.append(revised)
-    return tuple(output)
+    recover_pending_correction(ledger_root)
+    return output
 
 
 def merge_import_results(results: Iterable[ImportResult]) -> ImportResult:

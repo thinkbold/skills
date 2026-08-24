@@ -141,6 +141,7 @@ def append_audit_event(
     actor: str = "user",
     now: datetime | None = None,
     dedupe_key: str | None = None,
+    event_id: str | None = None,
 ) -> str:
     """Append one fsynced privacy-safe JSON line and return its event ID."""
     sensitive_key = _find_sensitive_key(payload)
@@ -155,7 +156,7 @@ def append_audit_event(
             if event.get("dedupe_key") == dedupe_key:
                 return str(event["event_id"])
 
-    event_id = uuid4().hex
+    event_id = event_id or uuid4().hex
     event: dict[str, object] = {
         "event_id": event_id,
         "timestamp": _utc_timestamp(now),
