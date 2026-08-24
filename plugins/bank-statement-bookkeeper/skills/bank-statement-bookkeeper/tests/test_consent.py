@@ -412,6 +412,13 @@ class ConsentTests(unittest.TestCase):
         manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual({logical_source: returned_hash}, manifest["source_hashes"])
         self.assertEqual(1, manifest["transaction_count"])
+        contribution = read_csv_rows(self.ledger / manifest["source_contributions"][logical_source]["path"])
+        self.assertEqual(1, len(contribution))
+        self.assertEqual(logical_source, contribution[0]["source_file"])
+        self.assertEqual("unclassified", contribution[0]["classification_status"])
+        self.assertEqual(("", "", "", "", ""), tuple(contribution[0][field] for field in (
+            "normalized_merchant", "account_code", "account_name", "rule_id", "review_note",
+        )))
         self.assertEqual(1, len(read_csv_rows(self.ledger / "outputs" / "normalized-transactions.csv")))
         self.assertEqual(1, len(read_csv_rows(self.ledger / "outputs" / "classified-transactions.csv")))
         self.assertTrue((self.ledger / "outputs" / "status.json").is_file())
@@ -467,6 +474,11 @@ class ConsentTests(unittest.TestCase):
         logical_source = f"external:{self.proposal.operation_id}"
         manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
         self.assertEqual({logical_source: second_hash}, manifest["source_hashes"])
+        current_snapshot = Path(manifest["source_contributions"][logical_source]["path"]).name
+        self.assertEqual(
+            {current_snapshot},
+            {path.name for path in (self.ledger / "work" / "import-contributions").iterdir()},
+        )
         imported_events = [
             event for event in read_audit_events(self.ledger)
             if event["event_type"] == "external_result_import_recorded"
@@ -528,6 +540,64 @@ class ConsentTests(unittest.TestCase):
         self.assertIn("inputs/changed.pdf:page:2/row:2", external_row["source_locations"])
         self.assertNotIn(old_provider_location, "|".join(row["source_locations"] for row in canonical))
 
+    def test_cli_changed_external_result_rebuilds_local_contribution_folded_into_external_primary(self) -> None:
+        """Catches reverse import order dropping a local row that was folded into an external primary."""
+        mapping_path = self.ledger / "work" / "local-map.json"
+        mapping_path.write_text(json.dumps({
+            "transaction_date": "Date", "posting_date": "Posted", "description": "Description",
+            "debit": "Debit", "credit": "Credit", "balance": "Balance", "reference": "Reference",
+            "date_formats": ["%Y-%m-%d"],
+        }), encoding="utf-8")
+        account_path = self.ledger / "work" / "local-account.json"
+        account_path.write_text(json.dumps({
+            "account_id": "checking-001", "institution": "Synthetic Bank",
+            "masked_label": "***1001", "currency": "CAD",
+        }), encoding="utf-8")
+        local_source = "inputs/local-overlap.csv"
+        local = self.ledger / local_source
+        local.write_text(
+            "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            "2026-01-05,2026-01-05,Synthetic merchant,20.00,,980.00,SYN-1\n",
+            encoding="utf-8",
+        )
+        consent_id = self._authorize()
+        logical_source = f"external:{self.proposal.operation_id}"
+        returned = self._write_result("reverse-overlap-result.csv", {})
+        first_code, _ = self._run_external_result(returned, consent_id)
+        self.assertEqual(0, first_code)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(0, import_statements.main([
+                "csv", str(self.ledger), local_source,
+                "--mapping", "work/local-map.json", "--account", "work/local-account.json",
+            ]))
+        folded = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+        self.assertEqual(1, len(folded))
+        self.assertEqual(logical_source, folded[0]["source_file"])
+        self.assertIn(f"{local_source}:2", folded[0]["source_locations"])
+        self._write_result("reverse-overlap-result.csv", {
+            "raw_description": "Changed synthetic merchant", "reference": "SYN-2", "outflow": "25.00",
+            "source_page_or_row": "page:2/row:2",
+            "source_locations": "inputs/changed.pdf:page:2/row:2",
+        })
+
+        second_code, _ = self._run_external_result(returned, consent_id)
+
+        self.assertEqual(0, second_code)
+        canonical = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+        derived = read_csv_rows(self.ledger / "outputs" / "normalized-transactions.csv")
+        manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(2, len(canonical))
+        self.assertEqual({local_source, logical_source}, set(manifest["source_hashes"]))
+        self.assertEqual({local_source, logical_source}, {row["source_file"] for row in canonical})
+        self.assertEqual(
+            {row["transaction_id"]: row for row in canonical},
+            {row["transaction_id"]: row for row in derived},
+        )
+        locations = "|".join(row["source_locations"] for row in canonical)
+        self.assertIn(f"{local_source}:2", locations)
+        self.assertIn("inputs/changed.pdf:page:2/row:2", locations)
+        self.assertNotIn("inputs/synthetic.pdf:page:2/row:1", locations)
+
     def test_cli_same_external_bytes_for_distinct_operations_are_independently_audited(self) -> None:
         """Catches equal returned bytes coalescing two independently authorized operations."""
         first_id = self._authorize()
@@ -559,6 +629,70 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(2, len({event["dedupe_key"] for event in imported_events}))
         self.assertEqual(1, len(read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")))
         self.assertEqual(1, imported_events[-1]["payload"]["overlap_count"])
+
+    def test_cli_fails_closed_when_existing_manifest_has_no_contribution_mapping(self) -> None:
+        """Catches reconstructing folded sources from canonical when a legacy manifest has no snapshots."""
+        consent_id = self._authorize()
+        returned = self._write_result("legacy-manifest-result.csv", {})
+        first_code, _ = self._run_external_result(returned, consent_id)
+        self.assertEqual(0, first_code)
+        manifest_path = self.ledger / "work" / "import-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        del manifest["source_contributions"]
+        del manifest["source_order"]
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        self._write_result("legacy-manifest-result.csv", {
+            "raw_description": "Changed synthetic merchant", "reference": "SYN-2", "outflow": "25.00",
+        })
+        expected = self._ledger_bytes()
+
+        return_code, output = self._run_external_result(returned, consent_id)
+
+        self.assertEqual(3, return_code)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+        self.assertEqual(expected, self._ledger_bytes())
+
+    def test_cli_fails_closed_when_a_current_contribution_snapshot_is_missing(self) -> None:
+        """Catches silently losing a source whose manifest-bound normalized snapshot disappeared."""
+        consent_id = self._authorize()
+        returned = self._write_result("missing-snapshot-result.csv", {})
+        first_code, _ = self._run_external_result(returned, consent_id)
+        self.assertEqual(0, first_code)
+        manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
+        logical_source = f"external:{self.proposal.operation_id}"
+        snapshot = self.ledger / manifest["source_contributions"][logical_source]["path"]
+        snapshot.unlink()
+        self._write_result("missing-snapshot-result.csv", {
+            "raw_description": "Changed synthetic merchant", "reference": "SYN-2", "outflow": "25.00",
+        })
+        expected = self._ledger_bytes()
+
+        return_code, output = self._run_external_result(returned, consent_id)
+
+        self.assertEqual(3, return_code)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+        self.assertEqual(expected, self._ledger_bytes())
+
+    def test_cli_fails_closed_when_a_current_contribution_snapshot_is_tampered(self) -> None:
+        """Catches rebuilding canonical from normalized snapshot bytes that no longer match the manifest."""
+        consent_id = self._authorize()
+        returned = self._write_result("tampered-snapshot-result.csv", {})
+        first_code, _ = self._run_external_result(returned, consent_id)
+        self.assertEqual(0, first_code)
+        manifest = json.loads((self.ledger / "work" / "import-manifest.json").read_text(encoding="utf-8"))
+        logical_source = f"external:{self.proposal.operation_id}"
+        snapshot = self.ledger / manifest["source_contributions"][logical_source]["path"]
+        snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+        self._write_result("tampered-snapshot-result.csv", {
+            "raw_description": "Changed synthetic merchant", "reference": "SYN-2", "outflow": "25.00",
+        })
+        expected = self._ledger_bytes()
+
+        return_code, output = self._run_external_result(returned, consent_id)
+
+        self.assertEqual(3, return_code)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+        self.assertEqual(expected, self._ledger_bytes())
 
     def test_cli_rejects_outside_and_cross_ledger_results_without_target_mutation(self) -> None:
         """Catches a result path escaping the selected ledger before admission persistence."""
