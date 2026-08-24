@@ -13,7 +13,7 @@ import stat
 import sys
 
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult
-from bookkeeper.classification import apply_exact_rules, load_rules
+from bookkeeper.classification import apply_exact_rules, load_rules, load_transactions, normalize_merchant
 from bookkeeper.consent import (
     admit_external_result,
     proposal_from_dict,
@@ -37,6 +37,7 @@ from bookkeeper.storage import (
     atomic_write_csv,
     atomic_write_json,
     mask_account_label,
+    read_audit_events,
     read_csv_rows,
     resolve_inside_ledger,
     replace_active_issues,
@@ -104,6 +105,18 @@ _CONTRIBUTION_DIRECTORY = Path("work") / "import-contributions"
 _UNCLASSIFIED_BLANK_FIELDS = (
     "normalized_merchant", "account_code", "account_name", "rule_id", "review_note",
 )
+_CORRECTION_RECORD_FIELDS = {
+    "actor", "corrected_value", "event_id", "field_name", "original_value",
+    "reason", "timestamp", "transaction_id",
+}
+_CORRECTABLE_FIELDS = {
+    "transaction_date", "posting_date", "inflow", "outflow", "running_balance",
+    "reference", "normalized_merchant", "classification_status", "account_code",
+    "account_name", "rule_id",
+}
+_SELECTED_CLASSIFICATION_EVENTS = {
+    "merchant_group_confirmed", "merchant_classification_corrected", "merchant_rule_replaced",
+}
 
 
 def _is_sha256(value: object) -> bool:
@@ -255,6 +268,156 @@ def _prune_unreferenced_contributions(
             path.unlink()
 
 
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _correction_records(ledger_root: Path) -> dict[str, dict[str, str]]:
+    path = resolve_inside_ledger(ledger_root, Path("work") / "corrections.jsonl")
+    if not path.exists():
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            loaded = json.loads(line)
+            if not isinstance(loaded, dict) or set(loaded) != _CORRECTION_RECORD_FIELDS:
+                raise ValueError("manual correction record is invalid")
+            if not all(isinstance(value, str) for value in loaded.values()):
+                raise ValueError("manual correction record is invalid")
+            record = {str(key): str(value) for key, value in loaded.items()}
+            event_id = record["event_id"]
+            if not event_id or event_id in records or record["field_name"] not in _CORRECTABLE_FIELDS:
+                raise ValueError("manual correction record is invalid")
+            records[event_id] = record
+    return records
+
+
+def _event_transaction_ids(event: dict[str, object]) -> tuple[str, ...]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("classification decision audit payload is invalid")
+    values = payload.get("transaction_ids")
+    if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
+        raise ValueError("classification decision transaction IDs are invalid")
+    transaction_ids = tuple(values)
+    if len(transaction_ids) != len(set(transaction_ids)):
+        raise ValueError("classification decision transaction IDs are invalid")
+    return transaction_ids
+
+
+def _decision_overlays(
+    ledger_root: Path,
+    current: tuple[dict[str, str], ...],
+) -> dict[str, dict[str, str]]:
+    """Return only durable audit-backed user decisions for unchanged transaction IDs."""
+    events = read_audit_events(ledger_root)
+    event_ids: set[str] = set()
+    for event in events:
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id or event_id in event_ids:
+            raise ValueError("audit event IDs are invalid")
+        event_ids.add(event_id)
+    records = _correction_records(ledger_root)
+    manual_events = {
+        str(event["event_id"]): event
+        for event in events if event.get("event_type") == "manual_correction_recorded"
+    }
+    if set(records) != set(manual_events):
+        raise ValueError("manual correction records do not match their audit events")
+    current_by_id = {row["transaction_id"]: row for row in current}
+    overlays: dict[str, dict[str, tuple[int, str]]] = {}
+    latest_classification: dict[str, tuple[int, dict[str, object]]] = {}
+    for index, event in enumerate(events):
+        event_type = event.get("event_type")
+        event_id = str(event["event_id"])
+        if event_type == "manual_correction_recorded":
+            record = records[event_id]
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("manual correction audit payload is invalid")
+            required = {
+                "corrected_value_sha256", "field_name", "original_value_sha256",
+                "reason_sha256", "transaction_id",
+            }
+            if not required.issubset(payload) or event.get("actor") != record["actor"]:
+                raise ValueError("manual correction audit linkage is invalid")
+            if (
+                payload["field_name"] != record["field_name"]
+                or payload["transaction_id"] != record["transaction_id"]
+                or payload["corrected_value_sha256"] != _hash_text(record["corrected_value"])
+                or payload["original_value_sha256"] != _hash_text(record["original_value"])
+                or payload["reason_sha256"] != _hash_text(record["reason"])
+            ):
+                raise ValueError("manual correction audit linkage is invalid")
+            transaction_writes = overlays.setdefault(record["transaction_id"], {})
+            transaction_writes[record["field_name"]] = (index, record["corrected_value"])
+            transaction_writes["review_note"] = (index, event_id)
+        elif event_type in _SELECTED_CLASSIFICATION_EVENTS:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("classification decision audit payload is invalid")
+            if event_type == "merchant_classification_corrected" and payload.get("scope") != "selected":
+                raise ValueError("selected classification audit scope is invalid")
+            if event_type == "merchant_rule_replaced" and payload.get("scope") != "future_rule":
+                raise ValueError("rule replacement audit scope is invalid")
+            for transaction_id in _event_transaction_ids(event):
+                latest_classification[transaction_id] = (index, event)
+    for transaction_id, (index, event) in latest_classification.items():
+        row = current_by_id.get(transaction_id)
+        if row is None:
+            continue
+        payload = event["payload"]
+        if not isinstance(payload, dict):
+            raise ValueError("classification decision audit payload is invalid")
+        account_code = payload.get("account_code")
+        account_name_hash = payload.get("account_name_sha256")
+        if not isinstance(account_code, str) or not _is_sha256(account_name_hash):
+            raise ValueError("classification decision category binding is invalid")
+        if (
+            row["classification_status"] != "classified"
+            or row["account_code"] != account_code
+            or _hash_text(row["account_name"]) != account_name_hash
+        ):
+            raise ValueError("classification decision does not match current canonical row")
+        merchant = normalize_merchant(row["raw_description"])
+        if event.get("event_type") == "merchant_group_confirmed":
+            merchant_hash = payload.get("normalized_merchant_sha256")
+            direction = "outflow" if row["outflow"] not in {"", "0"} else "inflow"
+            if not _is_sha256(merchant_hash) or _hash_text(merchant) != merchant_hash or payload.get("direction") != direction:
+                raise ValueError("classification decision merchant binding is invalid")
+        transaction_writes = overlays.setdefault(transaction_id, {})
+        for field, value in {
+            "classification_status": "classified",
+            "account_code": account_code,
+            "account_name": row["account_name"],
+            "rule_id": "",
+            "review_note": "",
+        }.items():
+            if field not in transaction_writes or transaction_writes[field][0] < index:
+                transaction_writes[field] = (index, value)
+    return {
+        transaction_id: {field: value for field, (_, value) in fields.items()}
+        for transaction_id, fields in overlays.items()
+    }
+
+
+def _apply_decision_overlays(
+    rows: tuple[dict[str, str], ...],
+    overlays: dict[str, dict[str, str]],
+) -> tuple[dict[str, str], ...]:
+    output = []
+    for source in rows:
+        row = dict(source)
+        overlay = overlays.get(row["transaction_id"], {})
+        row.update(overlay)
+        if overlay.get("classification_status") == "classified" and "normalized_merchant" not in overlay:
+            row["normalized_merchant"] = normalize_merchant(row["raw_description"])
+        output.append(row)
+    return tuple(output)
+
+
 def _ledger_input(ledger_root: Path, requested: Path) -> tuple[Path, str]:
     source = resolve_inside_ledger(ledger_root, requested)
     inputs_root = resolve_inside_ledger(ledger_root, "inputs")
@@ -330,8 +493,8 @@ def _record_import(
 ) -> dict[str, object]:
     manifest = _manifest(ledger_root)
     source_order, contributions, contribution_entries = _current_contributions(ledger_root, manifest)
-    replace_active_issues(ledger_root, "import", {"source": source_identity}, result.issues)
     if result.issues:
+        replace_active_issues(ledger_root, "import", {"source": source_identity}, result.issues)
         return {"status": "blocked", "issues": [issue.code for issue in result.issues]}
     previous_hashes = dict(manifest.get("source_hashes", {}))
     if set(result.source_hashes) != {source_identity}:
@@ -340,8 +503,11 @@ def _record_import(
     if not _is_sha256(source_hash):
         raise ValueError("import result source hash is invalid")
     canonical_path = resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv")
-    existing = tuple(read_csv_rows(canonical_path)) if canonical_path.exists() else ()
-    if previous_hashes.get(source_identity) == source_hash:
+    existing = load_transactions(ledger_root) if canonical_path.exists() else ()
+    changed = previous_hashes.get(source_identity) != source_hash
+    overlays = _decision_overlays(ledger_root, existing) if changed else {}
+    replace_active_issues(ledger_root, "import", {"source": source_identity}, ())
+    if not changed:
         merged = ImportResult(transactions=existing, source_hashes=previous_hashes)
         hashes = previous_hashes
     else:
@@ -354,7 +520,13 @@ def _record_import(
         )
         if source_identity not in source_order:
             source_order.append(source_identity)
-        merged = merge_import_results(contributions[source] for source in source_order)
+        merged = merge_import_results(
+            ImportResult(
+                transactions=_apply_decision_overlays(contributions[source].transactions, overlays),
+                source_hashes=contributions[source].source_hashes,
+            )
+            for source in source_order
+        )
         hashes = {**previous_hashes, **result.source_hashes}
     classified = apply_exact_rules(merged.transactions, load_rules(ledger_root))
     atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, classified.transactions)

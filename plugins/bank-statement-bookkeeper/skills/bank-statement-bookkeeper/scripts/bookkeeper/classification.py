@@ -526,7 +526,10 @@ def correct_transactions(ledger_root: Path, transactions: tuple[dict[str, str], 
         if item.get("transaction_id") in requested_ids:
             item.update({"normalized_merchant": _normalized(item), "classification_status": "classified", "account_code": code, "account_name": name, "rule_id": rule_id if scope == "future_rule" else item.get("rule_id", ""), "review_note": ""})
         output.append(item)
-    event_payload = {"transaction_ids": list(requested_ids), "account_code": code, "scope": scope}
+    event_payload = {
+        "transaction_ids": list(requested_ids), "account_code": code,
+        "account_name_sha256": hashlib.sha256(name.encode()).hexdigest(), "scope": scope,
+    }
     transactions_path = resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH)
     rules_path = resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH)
     atomic_write_csv(transactions_path, CANONICAL_TRANSACTION_FIELDS, tuple(output))
