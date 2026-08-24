@@ -43,6 +43,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertNotIn("total", groups[0])
             initial_rows = read_classified_rows(ledger)
             self.assertEqual(4, len(initial_rows))
+            self.assertEqual({("CAD", "AI-CAD-01"), ("CAD", "AI-REPEAT-01"), ("USD", "AI-USD-01")}, {(row["currency"], row["reference"]) for row in initial_rows})
             self.assertEqual(1, sum("inputs/cad-january.csv" in row["source_locations"] and "inputs/cad-overlap.csv" in row["source_locations"] for row in initial_rows))
             self.assertEqual(2, sum(row["reference"] == "AI-REPEAT-01" for row in initial_rows))
             confirmed = self.run_script(
@@ -57,6 +58,7 @@ class EndToEndTests(unittest.TestCase):
             with (ledger / "outputs" / "reconciliation.csv").open(newline="", encoding="utf-8") as handle:
                 reconciliations = list(csv.DictReader(handle))
             self.assertEqual(3, len(reconciliations))
+            self.assertEqual(sorted([("CAD", "2025-12-31", "statement_opening", "100.00", "100.00", "0.00", "true"), ("CAD", "2026-01-01", "prior_year_end_statement", "100.00", "70.00", "0.00", "true"), ("USD", "2026-01-01", "statement_opening", "200.00", "170.00", "0.00", "true")]), sorted((row["currency"], row["period_start"], row["opening_source_type"], row["opening_balance"], row["reported_closing"], row["difference"], row["reconciled"]) for row in reconciliations))
             cad_current = next(row for row in reconciliations if row["currency"] == "CAD" and row["period_start"] == "2026-01-01")
             self.assertEqual("prior_year_end_statement", cad_current["opening_source_type"])
             self._assert_output_bundle(ledger, status)
@@ -79,11 +81,29 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(1, len(read_rules(ledger)))
             self.assertEqual(1, len([line for line in (ledger / "audit" / "audit.jsonl").read_text(encoding="utf-8").splitlines() if 'merchant_group_confirmed' in line]))
 
+            self.assertEqual(0, self.run_script("validate_ledger.py", str(ledger)).returncode)
+            later_snapshot = _bundle_hashes(ledger)
             later_rows = (ledger / "work" / "normalized-transactions.csv").read_bytes()
+            later_audit = (ledger / "audit" / "audit.jsonl").read_bytes()
+            later_rules = (ledger / "merchant-rules.csv").read_bytes()
+            later_manifest = (ledger / "work" / "import-manifest.json").read_bytes()
+            later_ids = [row["transaction_id"] for row in later]
             self.assertEqual(0, import_later_fixture(self, ledger).returncode)
+            repeated_later_status = json.loads(self.run_script("validate_ledger.py", str(ledger)).stdout)
             self.assertEqual(later_rows, (ledger / "work" / "normalized-transactions.csv").read_bytes())
-            self.assertEqual(first_audit, (ledger / "audit" / "audit.jsonl").read_bytes()[:len(first_audit)])
-            self.assertNotEqual(first_hashes["outputs/status.json"], _bundle_hashes(ledger)["outputs/status.json"])
+            self.assertEqual(later_snapshot, _bundle_hashes(ledger))
+            self.assertEqual(later_audit, (ledger / "audit" / "audit.jsonl").read_bytes())
+            self.assertEqual(later_rules, (ledger / "merchant-rules.csv").read_bytes())
+            self.assertEqual(later_manifest, (ledger / "work" / "import-manifest.json").read_bytes())
+            self.assertEqual(later_ids, [row["transaction_id"] for row in read_classified_rows(ledger)])
+            self._assert_output_bundle(ledger, repeated_later_status)
+
+            other = Path(temp) / "other"
+            self.assertEqual(0, self.run_script("init_ledger.py", str(other), "--ledger-id", "other", "--company-name", "Other", "--base-currency", "CAD").returncode)
+            install_fixture_inputs(FIXTURE, other)
+            self.assertEqual(0, _import_phase(self, other, "initial").returncode)
+            self.assertEqual([], read_rules(other))
+            self.assertTrue(any(row["normalized_merchant"] == "OPENAI CHATGPT SUBSCRIPTION" and row["classification_status"] == "unclassified" for row in read_classified_rows(other)))
 
     def _assert_output_bundle(self, ledger: Path, status: dict[str, object]) -> None:
         paths = (
@@ -100,7 +120,7 @@ class EndToEndTests(unittest.TestCase):
         for relative, digest in hashes.items():
             self.assertEqual(_sha256(ledger / relative), digest)
         validation_events = [json.loads(line) for line in (ledger / "audit" / "audit.jsonl").read_text(encoding="utf-8").splitlines() if 'validation_completed' in line]
-        self.assertEqual(1, len(validation_events))
+        self.assertIn(len(validation_events), {1, 2})
         self.assertIn("output_hashes", validation_events[0]["payload"])
         self.assertNotIn("statement", json.dumps(validation_events[0], sort_keys=True).lower())
 
@@ -168,7 +188,7 @@ def _bundle_hashes(ledger: Path) -> dict[str, str]:
             "outputs/normalized-transactions.csv", "outputs/classified-transactions.csv",
             "outputs/account-summary.csv", "outputs/reconciliation.csv",
             "outputs/reconciliation-report.md", "outputs/exceptions.csv", "outputs/status.json",
-            "work/import-manifest.json",
+            "work/import-manifest.json", "work/pending-merchant-groups.csv", "merchant-rules.csv", "audit/audit.jsonl",
         )
     }
 
