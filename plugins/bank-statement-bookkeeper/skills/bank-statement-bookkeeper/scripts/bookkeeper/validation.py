@@ -31,21 +31,22 @@ _EXCEPTION_FIELDS = ("code", "blocking", "message", "source_file", "source_locat
 def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[Issue, ...]:
     """Block malformed canonical rows before grouping or reconciliation can omit them."""
     issues: list[Issue] = []
-    seen: set[str] = set()
-    for index, row in enumerate(transactions, start=1):
+    rows = tuple(transactions)
+    identifiers = [str(row.get("transaction_id") or "").strip() for row in rows]
+    duplicates = {value for value in identifiers if value and identifiers.count(value) > 1}
+    for index, row in enumerate(rows, start=1):
         if set(row) != set(CANONICAL_TRANSACTION_FIELDS) or len(row) != len(CANONICAL_TRANSACTION_FIELDS):
             issues.append(Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction schema is invalid.", True, source_location=str(index)))
             continue
         transaction_id = str(row.get("transaction_id") or "").strip()
-        if not transaction_id or transaction_id in seen:
+        if not transaction_id or transaction_id in duplicates:
             issues.append(Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction identity is invalid.", True, source_location=str(index)))
-        seen.add(transaction_id)
         account_id, currency = str(row.get("account_id") or "").strip(), str(row.get("currency") or "").strip()
         if not account_id:
             issues.append(Issue("ACCOUNT_UNCONFIRMED", "Canonical transaction account is missing.", True, source_location=str(index)))
         if not currency:
             issues.append(Issue("CURRENCY_MISSING", "Canonical transaction currency is missing.", True, source_location=str(index)))
-        if not str(row.get("raw_description") or "").strip() or not str(row.get("source_file") or "").strip() or not str(row.get("source_page_or_row") or "").strip():
+        if not all(str(row.get(field) or "").strip() for field in ("raw_description", "source_file", "source_page_or_row", "source_locations", "extraction_method", "extraction_confidence")):
             issues.append(Issue("CANONICAL_PROVENANCE_INVALID", "Canonical transaction evidence is missing.", True, source_location=str(index)))
         status = str(row.get("classification_status") or "")
         if status not in {"unclassified", "classified"} or (status == "classified" and not str(row.get("account_name") or "").strip()):
@@ -61,6 +62,15 @@ def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]
         except (InvalidOperation, ValueError):
             issues.append(Issue("AMOUNT_DIRECTION_AMBIGUOUS", "Canonical transaction amount direction is invalid.", True, source_location=str(index)))
     return tuple(issues)
+
+
+def admit_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[tuple[dict[str, str], ...], tuple[Issue, ...]]:
+    """Return only rows valid both locally and as part of this canonical batch."""
+    rows = tuple(transactions)
+    batch_issues = validate_canonical_transactions(rows)
+    duplicate_ids = {str(row.get("transaction_id") or "").strip() for row in rows if str(row.get("transaction_id") or "").strip() and sum(str(item.get("transaction_id") or "").strip() == str(row.get("transaction_id") or "").strip() for item in rows) > 1}
+    admitted = tuple(row for row in rows if str(row.get("transaction_id") or "").strip() not in duplicate_ids and not validate_canonical_transactions((row,)))
+    return admitted, batch_issues
 
 
 def count_pending_classifications(transactions: Iterable[Mapping[str, object]]) -> int:
@@ -135,8 +145,8 @@ def _masked_message(message: str, account_labels: Mapping[str, str] | None) -> s
     if not account_labels:
         return ""
     masked = message
-    for account_id, label in sorted(account_labels.items(), key=lambda item: -len(item[0])):
-        masked = masked.replace(account_id, label)
+    for account_id, _label in sorted(account_labels.items(), key=lambda item: -len(item[0])):
+        masked = masked.replace(account_id, f"account-{hashlib.sha256(account_id.encode('utf-8')).hexdigest()[:12]}")
     return masked
 
 

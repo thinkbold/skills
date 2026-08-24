@@ -77,7 +77,8 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual("blocked", result["state"])
             self.assertEqual("blocked", status["state"])
             self.assertNotIn("checking-001", exceptions)
-            self.assertIn("********9012", exceptions)
+            self.assertNotIn("********9012", exceptions)
+            self.assertIn("account-", exceptions)
 
     def test_empty_run_is_reconciliation_pending_and_complete_requires_transactions(self) -> None:
         """Catches an empty ledger being announced as complete without reconciliation units."""
@@ -139,7 +140,7 @@ class ValidationTests(unittest.TestCase):
             "posting_date": "2026-01-03", "inflow": "10", "outflow": "0", "running_balance": "10",
             "classification_status": "unclassified", "source_file": "synthetic.csv", "source_page_or_row": "2",
         })
-        orphaned = {**malformed, "transaction_id": "orphaned", "currency": "CAD", "raw_description": "!!!", "inflow": "10"}
+        orphaned = {**malformed, "transaction_id": "orphaned", "currency": "CAD", "raw_description": "!!!", "inflow": "10", "source_locations": "synthetic.csv:2", "extraction_method": "csv", "extraction_confidence": "high"}
         from bookkeeper.validation import count_pending_classifications, validate_canonical_transactions
         self.assertIn("CURRENCY_MISSING", {issue.code for issue in validate_canonical_transactions((malformed,))})
         self.assertEqual(1, count_pending_classifications((orphaned,)))
@@ -165,6 +166,30 @@ class ValidationTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
                 self.assertEqual(0, result.returncode, result.stderr)
                 self.assertEqual("blocked", json.loads(result.stdout)["state"])
+
+    def test_final_cli_blocks_blank_provenance_and_duplicate_ids_without_schema_shortcut(self) -> None:
+        """Catches invalid rows reaching exact rules or bypassing blocked status output."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            base = {field: "" for field in CANONICAL_TRANSACTION_FIELDS}
+            base.update({"transaction_id": "duplicate", "account_id": "checking", "currency": "CAD", "transaction_date": "2026-01-03", "posting_date": "2026-01-03", "raw_description": "Synthetic", "inflow": "10", "outflow": "0", "running_balance": "10", "source_file": "synthetic.csv", "source_page_or_row": "2", "source_locations": "synthetic.csv:2", "extraction_method": "csv", "extraction_confidence": "high", "classification_status": "unclassified"})
+            blank = {**base, "transaction_id": "blank-provenance", "source_locations": "", "extraction_method": "", "extraction_confidence": ""}
+            atomic_write_csv(ledger / "work" / "normalized-transactions.csv", CANONICAL_TRANSACTION_FIELDS, (base, {**base, "raw_description": "Other"}, blank))
+            result = subprocess.run([sys.executable, str(SKILL_ROOT / "scripts" / "validate_ledger.py"), str(ledger)], capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("blocked", json.loads(result.stdout)["state"])
+            self.assertTrue((ledger / "outputs" / "exceptions.csv").is_file())
+
+    def test_exception_labels_are_opaque_even_when_caller_supplies_raw_label(self) -> None:
+        """Catches untrusted account-label values being copied into exception output."""
+        with TemporaryDirectory() as temp:
+            ledger = Path(temp) / "ledger"
+            initialize_ledger(ledger, "synthetic", "Synthetic", "CAD")
+            finalize_outputs(ledger, has_transactions=False, pending_group_count=0, reconciliation_rows=(), issues=(Issue("PDF_PAGE_EMPTY", "checking-001 failed", True, "checking-001.pdf", "checking-001:2"),), account_labels={"checking-001": "123456789012"})
+            text = (ledger / "outputs" / "exceptions.csv").read_text(encoding="utf-8")
+            self.assertNotIn("checking-001", text)
+            self.assertNotIn("123456789012", text)
 
     def test_exception_sources_are_opaque(self) -> None:
         """Catches caller supplied account, filename, or location text escaping exceptions.csv."""
