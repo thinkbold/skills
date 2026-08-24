@@ -189,6 +189,56 @@ class ClassificationTests(unittest.TestCase):
         self.assertIn("merchant_rule_deactivated", event_types)
         self.assertIn("merchant_rule_deleted", event_types)
 
+    def test_deactivate_rule_retry_is_idempotent(self) -> None:
+        """Catches a repeated deactivation appending another event or changing a completed target."""
+        confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        rule_id = load_rules(self.ledger)[0]["rule_id"]
+        first = deactivate_rule(self.ledger, rule_id, "user")
+        repeated = deactivate_rule(self.ledger, rule_id, "user")
+        self.assertEqual(first, repeated)
+        self.assertEqual("inactive", load_rules(self.ledger)[0]["status"])
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deactivated"]))
+
+    def test_delete_rule_retry_is_idempotent(self) -> None:
+        """Catches a repeated deletion appending another event or restoring a removed current rule."""
+        confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        rule_id = load_rules(self.ledger)[0]["rule_id"]
+        first = delete_rule(self.ledger, rule_id, "user")
+        repeated = delete_rule(self.ledger, rule_id, "user")
+        self.assertEqual(first, repeated)
+        self.assertEqual([], load_rules(self.ledger))
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deleted"]))
+
+    def test_interrupted_deactivation_recovers_inactive_target_and_one_audit_event(self) -> None:
+        """Catches an audit failure leaving an active rule without a recoverable deactivation target."""
+        confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        rule_id = load_rules(self.ledger)[0]["rule_id"]
+        with patch("bookkeeper.classification.append_audit_event", side_effect=OSError("synthetic audit interruption")):
+            with self.assertRaisesRegex(OSError, "synthetic audit interruption"):
+                deactivate_rule(self.ledger, rule_id, "user")
+        self.assertEqual("inactive", load_rules(self.ledger)[0]["status"])
+        self.assertEqual([], [event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deactivated"])
+        self.assertTrue((self.ledger / "work" / "pending-classification-operation.json").exists())
+        recovered = deactivate_rule(self.ledger, rule_id, "user")
+        self.assertEqual("inactive", load_rules(self.ledger)[0]["status"])
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deactivated"]))
+        self.assertTrue(recovered)
+
+    def test_interrupted_deletion_recovers_absent_target_and_one_audit_event(self) -> None:
+        """Catches an audit failure leaving a current rule row without a recoverable deletion target."""
+        confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        rule_id = load_rules(self.ledger)[0]["rule_id"]
+        with patch("bookkeeper.classification.append_audit_event", side_effect=OSError("synthetic audit interruption")):
+            with self.assertRaisesRegex(OSError, "synthetic audit interruption"):
+                delete_rule(self.ledger, rule_id, "user")
+        self.assertEqual([], load_rules(self.ledger))
+        self.assertEqual([], [event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deleted"])
+        self.assertTrue((self.ledger / "work" / "pending-classification-operation.json").exists())
+        recovered = delete_rule(self.ledger, rule_id, "user")
+        self.assertEqual([], load_rules(self.ledger))
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deleted"]))
+        self.assertTrue(recovered)
+
     def test_future_rule_retry_is_idempotent_and_invalid_precondition_leaves_no_audit(self) -> None:
         """Catches retrying a successful correction replacing another rule or auditing a rejected correction."""
         confirmed = confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
