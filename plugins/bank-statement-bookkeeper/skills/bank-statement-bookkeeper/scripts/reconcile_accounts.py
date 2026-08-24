@@ -9,7 +9,7 @@ from pathlib import Path
 from bookkeeper.classification import apply_exact_rules, load_rules
 from bookkeeper.ledger import load_ledger
 from bookkeeper.storage import load_active_issues, replace_active_issues
-from bookkeeper.validation import count_pending_classifications, validate_canonical_transactions, load_canonical_for_validation
+from bookkeeper.validation import count_pending_classifications, admit_canonical_transactions, load_canonical_for_validation
 from bookkeeper.reconciliation import load_balance_rows, reconcile_all, write_reconciliation_outputs
 from bookkeeper.validation import collect_ledger_issues, determine_run_state
 
@@ -17,8 +17,7 @@ from bookkeeper.validation import collect_ledger_issues, determine_run_state
 def _run(ledger: Path) -> dict[str, object]:
     load_ledger(ledger)
     transactions, canonical_load_issues = load_canonical_for_validation(ledger)
-    canonical_issues = validate_canonical_transactions(transactions)
-    valid_transactions = tuple(row for row in transactions if not validate_canonical_transactions((row,)))
+    valid_transactions, canonical_issues = admit_canonical_transactions(transactions)
     classified = apply_exact_rules(valid_transactions, load_rules(ledger))
     replace_active_issues(ledger, "classification", {"view": "current"}, classified.issues)
     balance_rows, balance_issues = load_balance_rows(ledger)
