@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 
 from bookkeeper.classification import (
     apply_exact_rules,
     build_pending_groups,
+    ClassificationResult,
     confirm_group,
     correct_transactions,
     deactivate_rule,
@@ -17,8 +19,10 @@ from bookkeeper.classification import (
     export_rules,
     load_rules,
     load_transactions,
+    recover_pending_operation,
     save_transactions,
 )
+from bookkeeper.storage import read_audit_events
 
 
 def _json(value: object) -> None:
@@ -66,6 +70,7 @@ def main() -> int:
     deleted.add_argument("--actor", required=True)
     args = parser.parse_args()
     ledger = Path(args.ledger)
+    recover_pending_operation(ledger)
     if args.command == "pending":
         current = _current(ledger)
         groups = build_pending_groups(current.transactions)
@@ -74,8 +79,13 @@ def main() -> int:
         current = _current(ledger)
         group = next((item for item in build_pending_groups(current.transactions) if item.group_id == args.group_id), None)
         if group is None:
-            raise ValueError("pending group does not exist")
-        result = confirm_group(ledger, current.transactions, group.normalized_merchant, group.direction, args.account_code, args.account_name, args.apply_future, args.actor)
+            name_hash = hashlib.sha256(args.account_name.encode("utf-8")).hexdigest()
+            event = next((item for item in read_audit_events(ledger) if item.get("event_type") == "merchant_group_confirmed" and item.get("payload", {}).get("group_id") == args.group_id and item.get("payload", {}).get("account_code") == args.account_code and item.get("payload", {}).get("account_name_sha256") == name_hash and item.get("payload", {}).get("apply_future") == args.apply_future), None)
+            if event is None:
+                raise ValueError("pending group does not exist")
+            result = ClassificationResult(current.transactions, audit_event_ids=(str(event["event_id"]),))
+        else:
+            result = confirm_group(ledger, current.transactions, group.normalized_merchant, group.direction, args.account_code, args.account_name, args.apply_future, args.actor, group.transaction_ids)
         save_transactions(ledger, result.transactions)
         _json({"classified_count": sum(row["classification_status"] == "classified" for row in result.transactions), "created_rule_ids": [rule["rule_id"] for rule in result.created_rules], "audit_event_ids": list(result.audit_event_ids)})
     elif args.command == "correct":
