@@ -1,4 +1,5 @@
 from decimal import Decimal
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -13,6 +14,7 @@ import sys
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, MERCHANT_RULE_FIELDS, AccountContext
+from bookkeeper.classification import confirm_group, load_transactions, save_transactions
 from bookkeeper.ledger import initialize_ledger
 from bookkeeper.storage import atomic_write_csv, read_audit_events, read_csv_rows
 from bookkeeper.importing import (
@@ -571,6 +573,79 @@ class ImportingTests(unittest.TestCase):
             atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, (rule,))
             (ledger / "inputs" / "b.csv").write_text(
                 header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,978.00,B-1\n",
+                encoding="utf-8",
+            )
+            expected = self._ledger_bytes(ledger)
+
+            rejected = subprocess.run(
+                self._csv_command(ledger, "inputs/b.csv"), capture_output=True, text=True,
+            )
+
+            self.assertEqual(3, rejected.returncode)
+            self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+            self.assertEqual(expected, self._ledger_bytes(ledger))
+
+    def test_reused_rule_fails_closed_when_its_legacy_creation_audit_did_not_bind_the_rule_id(self) -> None:
+        """Catches defaulting an absent legacy rule binding to the candidate rule during replay."""
+        with TemporaryDirectory() as temp:
+            ledger = self._configured_ledger(temp)
+            header = "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            (ledger / "inputs" / "a.csv").write_text(
+                header
+                + "2026-01-05,2026-01-05,LEGACY MERCHANT,10.00,,990.00,A-1\n"
+                + "2026-01-06,2026-01-06,LEGACY MERCHANT,11.00,,979.00,A-2\n",
+                encoding="utf-8",
+            )
+            subprocess.run(self._csv_command(ledger, "inputs/a.csv"), check=True, capture_output=True, text=True)
+            original = load_transactions(ledger)
+            first = confirm_group(
+                ledger, original, "LEGACY MERCHANT", "outflow", "", "Legacy Category", True, "user",
+                (original[0]["transaction_id"],),
+            )
+            save_transactions(ledger, first.transactions)
+            legacy_event_id = first.audit_event_ids[0]
+            rule_id = first.created_rules[0]["rule_id"]
+            audit_path = ledger / "audit" / "audit.jsonl"
+            events = read_audit_events(ledger)
+            for event in events:
+                if event["event_id"] == legacy_event_id:
+                    event["payload"].pop("rule_id")
+            audit_path.write_text(
+                "".join(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            second = confirm_group(
+                ledger, first.transactions, "LEGACY MERCHANT", "outflow", "", "Legacy Category", True, "user",
+                (original[1]["transaction_id"],),
+            )
+            save_transactions(ledger, second.transactions)
+            self.assertEqual((), second.created_rules)
+            self.assertEqual(rule_id, second.transactions[1]["rule_id"])
+            latest_event = next(event for event in read_audit_events(ledger) if event["event_id"] == second.audit_event_ids[0])
+            self.assertEqual(rule_id, latest_event["payload"]["rule_id"])
+            rule = read_csv_rows(ledger / "merchant-rules.csv")[0]
+            self.assertEqual(legacy_event_id, rule["audit_event_id"])
+
+            manifest_path = ledger / "work" / "import-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            source = "inputs/a.csv"
+            snapshot_path = ledger / manifest["source_contributions"][source]["path"]
+            snapshot_rows = read_csv_rows(snapshot_path)
+            retained_snapshot = next(
+                row for row in snapshot_rows if row["transaction_id"] == original[1]["transaction_id"]
+            )
+            atomic_write_csv(snapshot_path, CANONICAL_TRANSACTION_FIELDS, (retained_snapshot,))
+            manifest["source_contributions"][source]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+            manifest["transaction_count"] = 1
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            retained_current = next(
+                row for row in second.transactions if row["transaction_id"] == original[1]["transaction_id"]
+            )
+            atomic_write_csv(
+                ledger / "work" / "normalized-transactions.csv", CANONICAL_TRANSACTION_FIELDS, (retained_current,),
+            )
+            (ledger / "inputs" / "b.csv").write_text(
+                header + "2026-02-05,2026-02-05,UNRELATED MERCHANT,12.00,,967.00,B-1\n",
                 encoding="utf-8",
             )
             expected = self._ledger_bytes(ledger)

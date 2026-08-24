@@ -444,7 +444,7 @@ def _decision_overlays(
                     or not isinstance(rule_payload, dict)
                     or rule_payload.get("account_code") != rule["account_code"]
                     or rule_payload.get("account_name_sha256") != _hash_text(rule["account_name"])
-                    or rule_payload.get("rule_id", rule_id) != rule_id
+                    or rule_payload.get("rule_id") != rule_id
                     or event_indexes[rule["audit_event_id"]] > index
                 ):
                     raise ValueError("classification decision rule linkage is invalid")
