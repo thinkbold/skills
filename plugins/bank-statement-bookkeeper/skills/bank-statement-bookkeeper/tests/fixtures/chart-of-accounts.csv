@@ -1,0 +1,4 @@
+account_code,account_name,active
+6100,Membership Fee,true
+6200,Software,true
+6999,Retired,false
