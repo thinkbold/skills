@@ -12,6 +12,77 @@ import unittest
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 FIXTURE = Path(__file__).parent / "fixtures" / "end-to-end"
+_EVIDENCE_FIELDS = (
+    "account_id", "currency", "transaction_date", "posting_date", "raw_description",
+    "inflow", "outflow", "running_balance", "reference", "source_file",
+    "source_page_or_row", "extraction_method", "extraction_confidence", "source_locations",
+)
+_INITIAL_EVIDENCE_BY_TRANSACTION_ID = {
+    "457148970687a84487f6e0090863acfeb6a0957af982dff9e8b03a7044950fcd": {
+        "account_id": "card-usd-002",
+        "currency": "USD",
+        "transaction_date": "2026-01-06",
+        "posting_date": "2026-01-06",
+        "raw_description": "OPENAI *CHATGPT SUBSCRIPTION 7H4K9",
+        "inflow": "0",
+        "outflow": "30.00",
+        "running_balance": "170.00",
+        "reference": "AI-USD-01",
+        "source_file": "inputs/usd-january.csv",
+        "source_page_or_row": "2",
+        "extraction_method": "csv",
+        "extraction_confidence": "high",
+        "source_locations": "inputs/usd-january.csv:2",
+    },
+    "4a617d801eefa5e5fcf2de4b23fa2334153bdf5027c652492d0bda8dc128519b": {
+        "account_id": "checking-cad-001",
+        "currency": "CAD",
+        "transaction_date": "2026-01-06",
+        "posting_date": "2026-01-06",
+        "raw_description": "OPENAI *CHATGPT SUBSCRIPTION 9F3A2",
+        "inflow": "0",
+        "outflow": "20.00",
+        "running_balance": "80.00",
+        "reference": "AI-CAD-01",
+        "source_file": "inputs/cad-january.csv",
+        "source_page_or_row": "2",
+        "extraction_method": "csv",
+        "extraction_confidence": "high",
+        "source_locations": "inputs/cad-january.csv:2|inputs/cad-overlap.csv:2",
+    },
+    "25db7937074e7fad8dbec34409ade7ebfbea0301dcc2181b9e29496ca5651ae9": {
+        "account_id": "checking-cad-001",
+        "currency": "CAD",
+        "transaction_date": "2026-01-08",
+        "posting_date": "2026-01-08",
+        "raw_description": "OPENAI *CHATGPT SUBSCRIPTION 7H4K9",
+        "inflow": "0",
+        "outflow": "5.00",
+        "running_balance": "70.00",
+        "reference": "AI-REPEAT-01",
+        "source_file": "inputs/cad-overlap.csv",
+        "source_page_or_row": "4",
+        "extraction_method": "csv",
+        "extraction_confidence": "high",
+        "source_locations": "inputs/cad-overlap.csv:4",
+    },
+    "b33a7d128dcb8c257e14d81fd174eba40b0bda5bc0206fd0ae5f7f2271e95669": {
+        "account_id": "checking-cad-001",
+        "currency": "CAD",
+        "transaction_date": "2026-01-08",
+        "posting_date": "2026-01-08",
+        "raw_description": "OPENAI *CHATGPT SUBSCRIPTION 7H4K9",
+        "inflow": "0",
+        "outflow": "5.00",
+        "running_balance": "75.00",
+        "reference": "AI-REPEAT-01",
+        "source_file": "inputs/cad-overlap.csv",
+        "source_page_or_row": "3",
+        "extraction_method": "csv",
+        "extraction_confidence": "high",
+        "source_locations": "inputs/cad-overlap.csv:3",
+    },
+}
 
 
 class EndToEndTests(unittest.TestCase):
@@ -42,10 +113,13 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual([["CAD", "30.00"], ["USD", "30.00"]], groups[0]["totals_by_currency"])
             self.assertNotIn("total", groups[0])
             initial_rows = read_classified_rows(ledger)
-            self.assertEqual(4, len(initial_rows))
-            self.assertEqual({("CAD", "AI-CAD-01"), ("CAD", "AI-REPEAT-01"), ("USD", "AI-USD-01")}, {(row["currency"], row["reference"]) for row in initial_rows})
-            self.assertEqual(1, sum("inputs/cad-january.csv" in row["source_locations"] and "inputs/cad-overlap.csv" in row["source_locations"] for row in initial_rows))
-            self.assertEqual(2, sum(row["reference"] == "AI-REPEAT-01" for row in initial_rows))
+            self.assertEqual(len(_INITIAL_EVIDENCE_BY_TRANSACTION_ID), len(initial_rows))
+            self.assertEqual(len(initial_rows), len({row["transaction_id"] for row in initial_rows}))
+            initial_evidence = {
+                row["transaction_id"]: {field: row[field] for field in _EVIDENCE_FIELDS}
+                for row in initial_rows
+            }
+            self.assertEqual(_INITIAL_EVIDENCE_BY_TRANSACTION_ID, initial_evidence)
             confirmed = self.run_script(
                 "classify_transactions.py", "confirm", str(ledger), groups[0]["group_id"],
                 "--account-code", "6100", "--account-name", "Membership Fee",
