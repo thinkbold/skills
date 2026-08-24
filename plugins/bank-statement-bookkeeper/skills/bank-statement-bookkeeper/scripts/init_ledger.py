@@ -6,8 +6,8 @@ import argparse
 import json
 from pathlib import Path
 
-from bookkeeper.ledger import initialize_ledger
-from bookkeeper.validation import recover_ledger_workflow
+from bookkeeper.ledger import initialize_ledger, lexical_ledger_root, load_ledger
+from bookkeeper.validation import publish_derived_outputs, recover_ledger_workflow
 
 
 class _UsageError(ValueError):
@@ -37,7 +37,13 @@ def main() -> int:
             arguments.ledger_dir, arguments.ledger_id, arguments.company_name,
             arguments.base_currency, arguments.fiscal_year_end,
         )
-        recover_ledger_workflow(arguments.ledger_dir.resolve())
+        ledger_root = lexical_ledger_root(arguments.ledger_dir)
+        # Existing and fresh initialization both pass through the same ledger
+        # gate and publish a complete, committed derived view.
+        load_ledger(ledger_root)
+        ledger_root = ledger_root.resolve()
+        recover_ledger_workflow(ledger_root)
+        status = publish_derived_outputs(ledger_root)
     except (OSError, ValueError):
         print(json.dumps({"error": "LEDGER_SCHEMA_INVALID"}, sort_keys=True))
         return 3
@@ -45,7 +51,7 @@ def main() -> int:
         print(json.dumps({"error": "INITIALIZATION_UNEXPECTED"}, sort_keys=True))
         return 4
     print(json.dumps({
-        "ledger_directory": str(arguments.ledger_dir.resolve()),
+        "ledger_directory": str(lexical_ledger_root(arguments.ledger_dir).resolve()),
         "ledger_id": config["ledger_id"],
         "schema_version": config["schema_version"],
         "status": "initialized",
