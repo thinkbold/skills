@@ -364,19 +364,62 @@ def _validate_staged_artifact(relative: str, path: Path, expected: str) -> None:
             rows = list(reader)
             if tuple(reader.fieldnames or ()) != expected_headers or any(None in row or set(row) != set(expected_headers) for row in rows):
                 raise ValueError("pending derived output is malformed")
-        if relative == "outputs/reconciliation.csv":
+        if relative in {"outputs/normalized-transactions.csv", "outputs/classified-transactions.csv"}:
+            admitted, issues = admit_canonical_transactions(rows)
+            if issues or len(admitted) != len(rows) or tuple(rows) != _ordered_transactions(rows):
+                raise ValueError("pending derived output is malformed")
+        elif relative == "outputs/account-summary.csv":
+            seen = set()
             for row in rows:
                 try:
-                    date.fromisoformat(str(row["period_start"])); date.fromisoformat(str(row["period_end"]))
-                    for field in ("inflows", "outflows", "difference"):
+                    unit = (row["account_label"], row["currency"])
+                    periods, reconciled = int(row["period_count"]), int(row["reconciled_period_count"])
+                    if not row["account_label"].startswith("account-") or not row["currency"] or periods < 0 or reconciled < 0 or reconciled > periods or row["state"] not in {state.value for state in RunState} or unit in seen:
+                        raise ValueError
+                    seen.add(unit)
+                except (KeyError, ValueError):
+                    raise ValueError("pending derived output is malformed")
+        if relative == "outputs/reconciliation.csv":
+            seen = set()
+            for row in rows:
+                try:
+                    start, end = date.fromisoformat(str(row["period_start"])), date.fromisoformat(str(row["period_end"]))
+                    unit = (row["account_label"], row["currency"], row["period_start"], row["period_end"])
+                    if not row["account_label"].startswith("account-") or not row["currency"] or end < start or unit in seen or row["reconciled"] not in {"true", "false"}:
+                        raise ValueError
+                    seen.add(unit)
+                    for field in ("opening_balance", "inflows", "outflows", "expected_closing", "reported_closing", "difference", "tolerance"):
                         if str(row[field]).strip():
-                            Decimal(str(row[field]))
+                            value = Decimal(str(row[field]))
+                            if not value.is_finite() or (field == "tolerance" and value < 0):
+                                raise ValueError
+                    if row["issue_codes"] and any(not re.fullmatch(r"[A-Z0-9_]+", code) for code in row["issue_codes"].split("|")):
+                        raise ValueError
                 except (KeyError, ValueError, InvalidOperation):
+                    raise ValueError("pending derived output is malformed")
+        elif relative == "outputs/exceptions.csv":
+            for row in rows:
+                if not re.fullmatch(r"[A-Z0-9_]+", row["code"]) or row["blocking"] not in {"true", "false"} or row["message"] != f"Issue: {row['code']}" or any(value and not value.startswith("source-") for value in (row["source_file"], row["source_location"])):
+                    raise ValueError("pending derived output is malformed")
+            if tuple(rows) != tuple(sorted(rows, key=lambda row: (row["code"], row["source_file"], row["source_location"], row["message"]))):
+                raise ValueError("pending derived output is malformed")
+        elif relative == "work/pending-merchant-groups.csv":
+            seen = set()
+            for row in rows:
+                try:
+                    if not row["group_id"] or row["group_id"] in seen or row["direction"] not in {"inflow", "outflow"} or int(row["transaction_count"]) <= 0:
+                        raise ValueError
+                    seen.add(row["group_id"]); date.fromisoformat(row["date_start"]); date.fromisoformat(row["date_end"])
+                    currencies = row["currencies"].split("|") if row["currencies"] else []
+                    totals = row["totals_by_currency"].split("|") if row["totals_by_currency"] else []
+                    if not currencies or len(currencies) != len(totals) or any(":" not in item or item.split(":", 1)[0] not in currencies or not Decimal(item.split(":", 1)[1]).is_finite() for item in totals):
+                        raise ValueError
+                except (ValueError, InvalidOperation):
                     raise ValueError("pending derived output is malformed")
     elif relative == "outputs/status.json":
         payload = json.loads(path.read_text(encoding="utf-8"))
         required = {"blocking_issue_count", "has_transactions", "output_hashes", "pending_group_count", "reconciled_unit_count", "state", "unit_count"}
-        if set(payload) != required or not isinstance(payload.get("output_hashes"), dict) or payload.get("state") not in {state.value for state in RunState}:
+        if set(payload) != required or not isinstance(payload.get("output_hashes"), dict) or payload.get("state") not in {state.value for state in RunState} or not isinstance(payload["has_transactions"], bool) or any(not isinstance(payload[field], int) or isinstance(payload[field], bool) or payload[field] < 0 for field in ("blocking_issue_count", "pending_group_count", "reconciled_unit_count", "unit_count")):
             raise ValueError("pending derived status is malformed")
         if any(not isinstance(value, str) or not _SHA256.fullmatch(value) for value in payload["output_hashes"].values()):
             raise ValueError("pending derived status is malformed")
@@ -429,6 +472,16 @@ def validate_pending_output_bundle(ledger_root: Path) -> None:
             expected_hashes[relative] = sha256_file(path)
     if status.get("output_hashes") != expected_hashes:
         raise ValueError("pending derived status is malformed")
+    def artifact_rows(relative: str) -> list[dict[str, str]]:
+        candidate = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / relative)
+        if not candidate.exists():
+            candidate = _lexical_protocol_path(ledger_root, Path(relative))
+        with candidate.open("r", encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+    normalized, classified = artifact_rows("outputs/normalized-transactions.csv"), artifact_rows("outputs/classified-transactions.csv")
+    groups, reconciliation, summary, exceptions = (artifact_rows(relative) for relative in ("work/pending-merchant-groups.csv", "outputs/reconciliation.csv", "outputs/account-summary.csv", "outputs/exceptions.csv"))
+    if {row["transaction_id"] for row in normalized} != {row["transaction_id"] for row in classified} or len(normalized) != len(classified) or status["has_transactions"] != bool(normalized) or status["pending_group_count"] != sum(int(row["transaction_count"]) for row in groups) or status["unit_count"] != len(reconciliation) or status["reconciled_unit_count"] != sum(row["reconciled"] == "true" for row in reconciliation) or status["blocking_issue_count"] != sum(row["blocking"] == "true" for row in exceptions) or {(row["account_label"], row["currency"]): (int(row["period_count"]), int(row["reconciled_period_count"])) for row in summary} != {(key[0], key[1]): (sum((row["account_label"], row["currency"]) == key for row in reconciliation), sum((row["account_label"], row["currency"]) == key and row["reconciled"] == "true" for row in reconciliation)) for key in {(row["account_label"], row["currency"]) for row in reconciliation}}:
+        raise ValueError("pending derived output cross-artifact validation failed")
     report_path = _lexical_protocol_path(ledger_root, _OUTPUT_BUNDLE_STAGE / "outputs/reconciliation-report.md")
     if not report_path.exists():
         report_path = _lexical_protocol_path(ledger_root, Path("outputs/reconciliation-report.md"))
@@ -552,7 +605,7 @@ def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = Fals
         "source_file": _opaque_source(issue.source_file), "source_location": _opaque_source(issue.source_location),
     } for issue in all_issues)
     artifacts: dict[str, bytes] = {
-        "outputs/normalized-transactions.csv": _csv_bytes(CANONICAL_TRANSACTION_FIELDS, _ordered_transactions(transactions)),
+        "outputs/normalized-transactions.csv": _csv_bytes(CANONICAL_TRANSACTION_FIELDS, _ordered_transactions(valid_transactions)),
         "outputs/classified-transactions.csv": _csv_bytes(CANONICAL_TRANSACTION_FIELDS, classified_rows),
         "outputs/exceptions.csv": _csv_bytes(_EXCEPTION_FIELDS, exceptions),
     }
@@ -579,7 +632,7 @@ def publish_derived_outputs(ledger_root: Path, *, record_validation: bool = Fals
     if audit.exists():
         hashes["audit/audit.jsonl"] = sha256_file(audit)
     status = {
-        "blocking_issue_count": sum(issue.blocking for issue in all_issues), "has_transactions": bool(transactions),
+        "blocking_issue_count": sum(issue.blocking for issue in all_issues), "has_transactions": bool(valid_transactions),
         "output_hashes": hashes, "pending_group_count": pending_group_count,
         "reconciled_unit_count": sum(row.reconciled for row in rows), "state": state.value, "unit_count": len(rows),
     }
