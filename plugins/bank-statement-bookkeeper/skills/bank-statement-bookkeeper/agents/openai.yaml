@@ -2,3 +2,5 @@ interface:
   display_name: "Bank Statement Bookkeeper"
   short_description: "Classify and reconcile bank statement transactions"
   default_prompt: "Use $bank-statement-bookkeeper to process the bank statements in my company ledger."
+policy:
+  allow_implicit_invocation: true
