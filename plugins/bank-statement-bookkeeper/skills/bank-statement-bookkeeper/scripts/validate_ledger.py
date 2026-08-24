@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from bookkeeper.ledger import load_ledger
-from bookkeeper.validation import publish_derived_outputs
+from bookkeeper.validation import publish_derived_outputs, recover_ledger_workflow
 
 
 class _UsageError(ValueError):
@@ -21,6 +21,7 @@ class _Parser(argparse.ArgumentParser):
 
 def _run(ledger: Path) -> dict[str, object]:
     load_ledger(ledger)
+    recover_ledger_workflow(ledger)
     return publish_derived_outputs(ledger, record_validation=True)
 
 

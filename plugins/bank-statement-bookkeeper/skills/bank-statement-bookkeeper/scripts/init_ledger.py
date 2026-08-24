@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from bookkeeper.ledger import initialize_ledger
+from bookkeeper.validation import recover_ledger_workflow
 
 
 class _UsageError(ValueError):
@@ -36,6 +37,7 @@ def main() -> int:
             arguments.ledger_dir, arguments.ledger_id, arguments.company_name,
             arguments.base_currency, arguments.fiscal_year_end,
         )
+        recover_ledger_workflow(arguments.ledger_dir.resolve())
     except (OSError, ValueError):
         print(json.dumps({"error": "LEDGER_SCHEMA_INVALID"}, sort_keys=True))
         return 3

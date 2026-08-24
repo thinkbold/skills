@@ -26,6 +26,7 @@ _PENDING_OPERATION_PATH = Path("work") / "pending-classification-operation.json"
 _STAGED_TRANSACTIONS_PATH = Path("work") / "pending-classification-transactions.csv"
 _STAGED_RULES_PATH = Path("work") / "pending-classification-rules.csv"
 _DATE_PATTERN = re.compile(r"\b(?:19|20)\d{2}[/-](?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])\b")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -283,11 +284,17 @@ def _completed_operation(ledger_root: Path, operation_key: str) -> str | None:
     return None
 
 
-def _install_staged_file(ledger_root: Path, staged_relative: Path, target_relative: Path, expected_hash: str) -> None:
+def _current_hash(path: Path) -> str:
+    return sha256_file(path) if path.exists() else ""
+
+
+def _install_staged_file(ledger_root: Path, staged_relative: Path, target_relative: Path, expected_hash: str, base_hash: str) -> None:
     staged = resolve_inside_ledger(ledger_root, staged_relative)
     target = resolve_inside_ledger(ledger_root, target_relative)
     if target.exists() and sha256_file(target) == expected_hash:
         return
+    if _current_hash(target) != base_hash:
+        raise ValueError("pending classification operation conflicts with current ledger state")
     if not staged.exists() or sha256_file(staged) != expected_hash:
         raise ValueError("pending classification operation cannot safely recover")
     os.replace(staged, target)
@@ -295,23 +302,51 @@ def _install_staged_file(ledger_root: Path, staged_relative: Path, target_relati
         raise ValueError("pending classification operation wrote an unexpected target")
 
 
+def validate_pending_operation(ledger_root: Path) -> None:
+    """Reject a stale or malformed classification operation without touching its targets."""
+    journal_path = resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH)
+    if not journal_path.exists():
+        return
+    with journal_path.open("r", encoding="utf-8") as handle:
+        journal = json.load(handle)
+    required = {
+        "actor", "audit_event_id", "base_rules_sha256", "base_transactions_sha256", "event_payload", "event_type", "operation_key",
+        "rules_sha256", "transactions_sha256",
+    }
+    if not isinstance(journal, dict) or set(journal) != required or not isinstance(journal["event_payload"], dict):
+        raise ValueError("pending classification operation is invalid")
+    for key in ("base_rules_sha256", "base_transactions_sha256", "rules_sha256"):
+        if not isinstance(journal[key], str) or (journal[key] and not _SHA256.fullmatch(journal[key])):
+            raise ValueError("pending classification operation is invalid")
+    if journal["transactions_sha256"] is not None and (not isinstance(journal["transactions_sha256"], str) or not _SHA256.fullmatch(journal["transactions_sha256"])):
+        raise ValueError("pending classification operation is invalid")
+    rules = resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH)
+    current_rules = resolve_inside_ledger(ledger_root, _RULES_PATH)
+    if (not rules.is_file() or sha256_file(rules) != journal["rules_sha256"]) and _current_hash(current_rules) != journal["rules_sha256"]:
+        raise ValueError("pending classification operation is invalid")
+    if _current_hash(current_rules) not in {journal["base_rules_sha256"], journal["rules_sha256"]}:
+        raise ValueError("pending classification operation conflicts with current ledger state")
+    if journal["transactions_sha256"] is not None:
+        transactions = resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH)
+        current_transactions = resolve_inside_ledger(ledger_root, _CANONICAL_PATH)
+        if (not transactions.is_file() or sha256_file(transactions) != journal["transactions_sha256"]) and _current_hash(current_transactions) != journal["transactions_sha256"]:
+            raise ValueError("pending classification operation is invalid")
+        if _current_hash(current_transactions) not in {journal["base_transactions_sha256"], journal["transactions_sha256"]}:
+            raise ValueError("pending classification operation conflicts with current ledger state")
+
+
 def recover_pending_operation(ledger_root: Path) -> str | None:
     """Complete a previously staged classification mutation exactly once."""
     journal_path = resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH)
     if not journal_path.exists():
         return None
+    validate_pending_operation(ledger_root)
     with journal_path.open("r", encoding="utf-8") as handle:
         journal = json.load(handle)
-    required = {
-        "actor", "audit_event_id", "event_payload", "event_type", "operation_key",
-        "rules_sha256", "transactions_sha256",
-    }
-    if not isinstance(journal, dict) or set(journal) != required or not isinstance(journal["event_payload"], dict):
-        raise ValueError("pending classification operation is invalid")
     transactions_hash = journal["transactions_sha256"]
     if transactions_hash is not None:
-        _install_staged_file(ledger_root, _STAGED_TRANSACTIONS_PATH, _CANONICAL_PATH, str(transactions_hash))
-    _install_staged_file(ledger_root, _STAGED_RULES_PATH, _RULES_PATH, str(journal["rules_sha256"]))
+        _install_staged_file(ledger_root, _STAGED_TRANSACTIONS_PATH, _CANONICAL_PATH, str(transactions_hash), str(journal["base_transactions_sha256"]))
+    _install_staged_file(ledger_root, _STAGED_RULES_PATH, _RULES_PATH, str(journal["rules_sha256"]), str(journal["base_rules_sha256"]))
     event_id = append_audit_event(
         ledger_root, str(journal["event_type"]), dict(journal["event_payload"]),
         actor=str(journal["actor"]), dedupe_key=str(journal["operation_key"]), event_id=str(journal["audit_event_id"]),
@@ -342,6 +377,8 @@ def _stage_rule_operation(
         "event_payload": {"rule_id": rule_id},
         "event_type": event_type,
         "operation_key": operation_key,
+        "base_rules_sha256": _current_hash(resolve_inside_ledger(ledger_root, _RULES_PATH)),
+        "base_transactions_sha256": _current_hash(resolve_inside_ledger(ledger_root, _CANONICAL_PATH)),
         "rules_sha256": sha256_file(rules_path),
         "transactions_sha256": None,
     })
@@ -428,6 +465,8 @@ def confirm_group(
     atomic_write_json(resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH), {
         "actor": actor, "audit_event_id": event_id, "event_payload": event_payload,
         "event_type": "merchant_group_confirmed", "operation_key": operation_key,
+        "base_rules_sha256": _current_hash(resolve_inside_ledger(ledger_root, _RULES_PATH)),
+        "base_transactions_sha256": _current_hash(resolve_inside_ledger(ledger_root, _CANONICAL_PATH)),
         "rules_sha256": sha256_file(rules_path), "transactions_sha256": sha256_file(transactions_path),
     })
     recovered = recover_pending_operation(ledger_root)
@@ -495,7 +534,8 @@ def correct_transactions(ledger_root: Path, transactions: tuple[dict[str, str], 
     atomic_write_json(resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH), {
         "actor": actor, "audit_event_id": audit_event_id, "event_payload": event_payload,
         "event_type": "merchant_rule_replaced" if scope == "future_rule" else "merchant_classification_corrected",
-        "operation_key": operation_key, "rules_sha256": sha256_file(rules_path),
+        "operation_key": operation_key, "base_rules_sha256": _current_hash(resolve_inside_ledger(ledger_root, _RULES_PATH)),
+        "base_transactions_sha256": _current_hash(resolve_inside_ledger(ledger_root, _CANONICAL_PATH)), "rules_sha256": sha256_file(rules_path),
         "transactions_sha256": sha256_file(transactions_path),
     })
     recovered = recover_pending_operation(ledger_root)

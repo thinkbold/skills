@@ -38,7 +38,7 @@ from bookkeeper.storage import (
     replace_active_issues,
     sha256_file,
 )
-from bookkeeper.validation import publish_derived_outputs
+from bookkeeper.validation import publish_derived_outputs, recover_ledger_workflow
 
 
 class _UsageError(ValueError):
@@ -146,10 +146,7 @@ def _record_import(
         retained = tuple(row for row in existing if row["source_file"] != source_identity)
         merged = merge_import_results((ImportResult(transactions=retained, source_hashes=previous_hashes), result))
     classified = apply_exact_rules(merged.transactions, load_rules(ledger_root))
-    ordered = tuple(sorted(classified.transactions, key=lambda row: (
-        row["account_id"], row["currency"], row["transaction_date"], row["posting_date"], row["transaction_id"],
-    )))
-    atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, ordered)
+    atomic_write_csv(canonical_path, CANONICAL_TRANSACTION_FIELDS, classified.transactions)
     hashes = {**previous_hashes, **result.source_hashes}
     atomic_write_json(resolve_inside_ledger(ledger_root, Path("work") / "import-manifest.json"), {
         "source_hashes": hashes,
@@ -161,7 +158,6 @@ def _record_import(
         {"source_hashes": hashes, "transaction_count": len(merged.transactions), "overlap_count": len(merged.duplicate_sources)},
         dedupe_key=f"{event_type}:{source_hash}",
     )
-    publish_derived_outputs(ledger_root)
     return {"status": "imported", "transaction_count": len(merged.transactions), "audit_event_id": event_id}
 
 
@@ -295,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ledger_root = args.ledger_dir.resolve()
         load_ledger(ledger_root)
-        recover_pending_correction(ledger_root)
+        recover_ledger_workflow(ledger_root)
         if args.command == "inventory":
             inputs = tuple(_ledger_input(ledger_root, path) for path in args.inputs)
             candidates = discover_account_candidates(tuple(
@@ -330,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
             output = _external_result(ledger_root, args)
         else:
             output = _correct_row(ledger_root, args)
+        publish_derived_outputs(ledger_root)
     except (OSError, ValueError, json.JSONDecodeError):
         print(json.dumps({"error": "LEDGER_SCHEMA_INVALID"}, sort_keys=True))
         return 3
