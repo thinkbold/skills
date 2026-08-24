@@ -217,6 +217,7 @@ def _propose_external(ledger_root: Path, proposal_file: str) -> dict[str, object
 
 def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
     _, proposal = _read_proposal(ledger_root, args.proposal)
+    print(json.dumps({"status": "disclosure", "disclosure": proposal_to_dict(proposal)}, sort_keys=True))
     consent_id = record_external_decision(ledger_root, proposal, args.decision == "authorized", args.actor)
     return {"status": "authorized" if args.decision == "authorized" else "declined", "consent_id": consent_id}
 

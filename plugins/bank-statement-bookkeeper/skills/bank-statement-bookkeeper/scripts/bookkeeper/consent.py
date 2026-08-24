@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -24,17 +24,26 @@ from .storage import append_audit_event, read_audit_events
 
 _DECISION_EVENT_TYPE = "external_processing_consent_decision"
 _HASH = re.compile(r"^[0-9a-f]{64}$")
+_NONCE = re.compile(r"^[0-9a-f]{32}$")
 _PAGE_LOCATION = re.compile(r"^page:([1-9][0-9]*)/row:([1-9][0-9]*)$")
 _FIELD_REQUIREMENTS = {
     "date": ("transaction_date", "posting_date"),
     "description": ("raw_description",),
     "amount": ("inflow", "outflow"),
 }
+_REQUIRED_RESULT_FIELDS = frozenset({
+    "transaction_id", "account_id", "currency", "transaction_date", "posting_date",
+    "raw_description", "inflow", "outflow", "running_balance", "source_file",
+    "source_page_or_row", "extraction_method", "extraction_confidence",
+    "classification_status", "source_locations",
+})
+_ISO_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 @dataclass(frozen=True)
 class ExternalProcessingProposal:
     operation_id: str
+    nonce: str
     provider: str
     source_hash: str
     pages: tuple[int, ...]
@@ -81,6 +90,51 @@ def _operation_id(provider: str, source_hash: str, pages: tuple[int, ...], field
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
+def _normalized_proposal(
+    *,
+    provider: object,
+    source_hash: object,
+    pages: object,
+    fields: object,
+    sensitive_data: object,
+    retention_risk: object,
+    training_risk: object,
+    regional_risk: object,
+    redactions: object,
+    manual_alternative: object,
+    nonce: object,
+    operation_id: object | None = None,
+) -> ExternalProcessingProposal:
+    provider_text = _required_text(provider, "provider")
+    hash_text = _required_text(source_hash, "source_hash").lower()
+    if not _HASH.fullmatch(hash_text):
+        raise ValueError("proposal source_hash must be a SHA-256 digest")
+    nonce_text = _required_text(nonce, "nonce").lower()
+    if not _NONCE.fullmatch(nonce_text):
+        raise ValueError("proposal nonce is invalid")
+    normalized_pages = _pages(pages)
+    normalized_fields = _text_tuple(fields, "fields")
+    if set(normalized_fields).difference(_FIELD_REQUIREMENTS):
+        raise ValueError("proposal fields are not supported")
+    expected_operation_id = _operation_id(provider_text, hash_text, normalized_pages, normalized_fields, nonce_text)
+    if operation_id is not None and _required_text(operation_id, "operation_id").lower() != expected_operation_id:
+        raise ValueError("proposal operation_id does not match its disclosed scope")
+    return ExternalProcessingProposal(
+        operation_id=expected_operation_id,
+        nonce=nonce_text,
+        provider=provider_text,
+        source_hash=hash_text,
+        pages=normalized_pages,
+        fields=normalized_fields,
+        sensitive_data=_text_tuple(sensitive_data, "sensitive_data"),
+        retention_risk=_required_text(retention_risk, "retention_risk"),
+        training_risk=_required_text(training_risk, "training_risk"),
+        regional_risk=_required_text(regional_risk, "regional_risk"),
+        redactions=_text_tuple(redactions, "redactions"),
+        manual_alternative=_required_text(manual_alternative, "manual_alternative"),
+    )
+
+
 def create_external_proposal(
     *,
     provider: str,
@@ -95,27 +149,11 @@ def create_external_proposal(
     manual_alternative: str,
 ) -> ExternalProcessingProposal:
     """Create one non-reusable disclosure for one proposed external operation."""
-    provider_text = _required_text(provider, "provider")
-    hash_text = _required_text(source_hash, "source_hash").lower()
-    if not _HASH.fullmatch(hash_text):
-        raise ValueError("proposal source_hash must be a SHA-256 digest")
-    normalized_pages = _pages(pages)
-    normalized_fields = _text_tuple(fields, "fields")
-    unknown_fields = set(normalized_fields).difference(_FIELD_REQUIREMENTS)
-    if unknown_fields:
-        raise ValueError("proposal fields are not supported")
-    return ExternalProcessingProposal(
-        operation_id=_operation_id(provider_text, hash_text, normalized_pages, normalized_fields, uuid4().hex),
-        provider=provider_text,
-        source_hash=hash_text,
-        pages=normalized_pages,
-        fields=normalized_fields,
-        sensitive_data=_text_tuple(sensitive_data, "sensitive_data"),
-        retention_risk=_required_text(retention_risk, "retention_risk"),
-        training_risk=_required_text(training_risk, "training_risk"),
-        regional_risk=_required_text(regional_risk, "regional_risk"),
-        redactions=_text_tuple(redactions, "redactions"),
-        manual_alternative=_required_text(manual_alternative, "manual_alternative"),
+    return _normalized_proposal(
+        provider=provider, source_hash=source_hash, pages=pages, fields=fields,
+        sensitive_data=sensitive_data, retention_risk=retention_risk, training_risk=training_risk,
+        regional_risk=regional_risk, redactions=redactions, manual_alternative=manual_alternative,
+        nonce=uuid4().hex,
     )
 
 
@@ -126,22 +164,26 @@ def proposal_to_dict(proposal: ExternalProcessingProposal) -> dict[str, object]:
 
 def proposal_from_dict(payload: Mapping[str, object]) -> ExternalProcessingProposal:
     """Validate a locally saved disclosure without generating a new operation ID."""
-    proposal = create_external_proposal(
+    operation_id = payload.get("operation_id")
+    nonce = payload.get("nonce")
+    if operation_id is None and nonce is None:
+        return create_external_proposal(
+            provider=payload.get("provider", ""), source_hash=payload.get("source_hash", ""),
+            pages=payload.get("pages", ()), fields=payload.get("fields", ()),
+            sensitive_data=payload.get("sensitive_data", ()), retention_risk=payload.get("retention_risk", ""),
+            training_risk=payload.get("training_risk", ""), regional_risk=payload.get("regional_risk", ""),
+            redactions=payload.get("redactions", ()), manual_alternative=payload.get("manual_alternative", ""),
+        )
+    if operation_id is None or nonce is None:
+        raise ValueError("proposal operation_id and nonce must both be present")
+    return _normalized_proposal(
         provider=payload.get("provider", ""), source_hash=payload.get("source_hash", ""),
         pages=payload.get("pages", ()), fields=payload.get("fields", ()),
         sensitive_data=payload.get("sensitive_data", ()), retention_risk=payload.get("retention_risk", ""),
         training_risk=payload.get("training_risk", ""), regional_risk=payload.get("regional_risk", ""),
         redactions=payload.get("redactions", ()), manual_alternative=payload.get("manual_alternative", ""),
+        nonce=nonce, operation_id=operation_id,
     )
-    operation_id = payload.get("operation_id")
-    if operation_id is None:
-        return proposal
-    operation_id_text = _required_text(operation_id, "operation_id")
-    if not _HASH.fullmatch(operation_id_text):
-        raise ValueError("proposal operation_id is invalid")
-    return ExternalProcessingProposal(operation_id=operation_id_text, **{
-        key: value for key, value in proposal_to_dict(proposal).items() if key != "operation_id"
-    })
 
 
 def _scope_payload(proposal: ExternalProcessingProposal) -> dict[str, object]:
@@ -175,6 +217,7 @@ def record_external_decision(
     """Append the user's current answer for exactly one disclosed operation."""
     if not isinstance(authorized, bool):
         raise ValueError("authorization decision must be boolean")
+    proposal = proposal_from_dict(proposal_to_dict(proposal))
     return append_audit_event(
         ledger_root, _DECISION_EVENT_TYPE, _decision_payload(proposal, authorized), actor=actor, now=now,
     )
@@ -265,7 +308,45 @@ def _canonical_rows(result_path: Path) -> tuple[tuple[dict[str, str], ...], Impo
         return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result cannot be read as a local canonical CSV.")
     if not rows:
         return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result has no transaction rows.")
+    if any(not _valid_canonical_row(row) for row in rows):
+        return (), _issue("EXTERNAL_RESULT_INVALID", "Returned result has malformed canonical transaction values.")
     return rows, None
+
+
+def _valid_iso_date(value: str) -> bool:
+    if not _ISO_DATE.fullmatch(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _finite_decimal(value: str) -> Decimal | None:
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _valid_canonical_row(row: Mapping[object, object]) -> bool:
+    """Validate a complete canonical result row before scope/provenance checks."""
+    if set(row) != set(CANONICAL_TRANSACTION_FIELDS) or len(row) != len(CANONICAL_TRANSACTION_FIELDS):
+        return False
+    if any(not isinstance(row[field], str) for field in CANONICAL_TRANSACTION_FIELDS):
+        return False
+    if any(not row[field].strip() for field in _REQUIRED_RESULT_FIELDS):
+        return False
+    if not _valid_iso_date(str(row["transaction_date"])) or not _valid_iso_date(str(row["posting_date"])):
+        return False
+    inflow = _finite_decimal(str(row["inflow"]))
+    outflow = _finite_decimal(str(row["outflow"]))
+    balance = _finite_decimal(str(row["running_balance"]))
+    if inflow is None or outflow is None or balance is None:
+        return False
+    return (inflow > 0 and outflow == 0) or (outflow > 0 and inflow == 0)
 
 
 def _has_requested_fields(row: Mapping[str, str], fields: tuple[str, ...]) -> bool:
