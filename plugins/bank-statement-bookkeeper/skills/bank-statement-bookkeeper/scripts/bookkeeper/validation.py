@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import csv
 from pathlib import Path
 from typing import Iterable, Mapping
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from .contracts import Issue, RunState
+from .contracts import CANONICAL_TRANSACTION_FIELDS
 from .reconciliation import ReconciliationRow
 from .storage import atomic_write_csv, atomic_write_json, resolve_inside_ledger
 
@@ -29,12 +31,25 @@ _EXCEPTION_FIELDS = ("code", "blocking", "message", "source_file", "source_locat
 def validate_canonical_transactions(transactions: Iterable[Mapping[str, object]]) -> tuple[Issue, ...]:
     """Block malformed canonical rows before grouping or reconciliation can omit them."""
     issues: list[Issue] = []
+    seen: set[str] = set()
     for index, row in enumerate(transactions, start=1):
+        if set(row) != set(CANONICAL_TRANSACTION_FIELDS) or len(row) != len(CANONICAL_TRANSACTION_FIELDS):
+            issues.append(Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction schema is invalid.", True, source_location=str(index)))
+            continue
+        transaction_id = str(row.get("transaction_id") or "").strip()
+        if not transaction_id or transaction_id in seen:
+            issues.append(Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction identity is invalid.", True, source_location=str(index)))
+        seen.add(transaction_id)
         account_id, currency = str(row.get("account_id") or "").strip(), str(row.get("currency") or "").strip()
         if not account_id:
             issues.append(Issue("ACCOUNT_UNCONFIRMED", "Canonical transaction account is missing.", True, source_location=str(index)))
         if not currency:
             issues.append(Issue("CURRENCY_MISSING", "Canonical transaction currency is missing.", True, source_location=str(index)))
+        if not str(row.get("raw_description") or "").strip() or not str(row.get("source_file") or "").strip() or not str(row.get("source_page_or_row") or "").strip():
+            issues.append(Issue("CANONICAL_PROVENANCE_INVALID", "Canonical transaction evidence is missing.", True, source_location=str(index)))
+        status = str(row.get("classification_status") or "")
+        if status not in {"unclassified", "classified"} or (status == "classified" and not str(row.get("account_name") or "").strip()):
+            issues.append(Issue("CANONICAL_STATUS_INVALID", "Canonical transaction classification is invalid.", True, source_location=str(index)))
         try:
             date.fromisoformat(str(row.get("transaction_date") or "")); date.fromisoformat(str(row.get("posting_date") or ""))
         except ValueError:
@@ -57,6 +72,26 @@ def count_pending_classifications(transactions: Iterable[Mapping[str, object]]) 
         if not validate_canonical_transactions((row,)):
             total += 1
     return total
+
+
+def load_canonical_for_validation(ledger_root: Path) -> tuple[tuple[dict[str, str], ...], tuple[Issue, ...]]:
+    """Load canonical CSV without throwing malformed rows into later parsing stages."""
+    path = resolve_inside_ledger(ledger_root, Path("work") / "normalized-transactions.csv")
+    if not path.exists():
+        return (), ()
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != CANONICAL_TRANSACTION_FIELDS:
+                return (), (Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction schema is invalid.", True),)
+            rows = []
+            for raw in reader:
+                if None in raw or any(raw.get(field) is None for field in CANONICAL_TRANSACTION_FIELDS):
+                    return (), (Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction schema is invalid.", True),)
+                rows.append({field: str(raw[field]) for field in CANONICAL_TRANSACTION_FIELDS})
+    except (OSError, csv.Error, UnicodeError):
+        return (), (Issue("CANONICAL_SCHEMA_INVALID", "Canonical transaction schema is invalid.", True),)
+    return tuple(rows), ()
 
 
 def determine_run_state(
@@ -98,11 +133,15 @@ def collect_ledger_issues(
 
 def _masked_message(message: str, account_labels: Mapping[str, str] | None) -> str:
     if not account_labels:
-        return message
+        return ""
     masked = message
     for account_id, label in sorted(account_labels.items(), key=lambda item: -len(item[0])):
         masked = masked.replace(account_id, label)
     return masked
+
+
+def _opaque_source(value: str) -> str:
+    return "" if not value else f"source-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:16]}"
 
 
 def finalize_outputs(
@@ -121,8 +160,9 @@ def finalize_outputs(
     state = determine_run_state(has_transactions, pending_group_count, reconciliation_rows, all_issues)
     exceptions = [{
         "code": issue.code, "blocking": str(issue.blocking).lower(),
-        "message": _masked_message(issue.message, labels), "source_file": issue.source_file,
-        "source_location": issue.source_location,
+        "message": _masked_message(issue.message, labels) or f"Issue: {issue.code}",
+        "source_file": _opaque_source(issue.source_file),
+        "source_location": _opaque_source(issue.source_location),
     } for issue in all_issues]
     outputs = resolve_inside_ledger(ledger_root, "outputs")
     atomic_write_csv(outputs / "exceptions.csv", _EXCEPTION_FIELDS, exceptions)

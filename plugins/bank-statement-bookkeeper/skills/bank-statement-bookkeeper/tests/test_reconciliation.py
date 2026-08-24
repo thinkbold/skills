@@ -171,7 +171,7 @@ class ReconciliationTests(unittest.TestCase):
         rows = reconcile_all(
             (transaction("checking-001", "CAD", "2026-01-03", "10.00", "0"),),
             (
-                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="100.00", opening_source_type="user_provided"),
+                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="100.00", closing_balance="100.00", opening_source_type="user_provided"),
                 balance(opening_balance="", closing_balance="110.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
             ),
         )
@@ -183,13 +183,13 @@ class ReconciliationTests(unittest.TestCase):
         """Catches contradictory or unconfirmed predecessor evidence being trusted."""
         mismatch = reconcile_all(
             (), (
-                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="100.00"),
+                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="100.00", closing_balance="100.00"),
                 balance(opening_balance="99.00", closing_balance="99.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
             ),
         )
         unconfirmed = reconcile_all(
             (), (
-                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="100.00", confirmed="false"),
+                balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="100.00", closing_balance="100.00", confirmed="false"),
                 balance(opening_balance="", closing_balance="100.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
             ),
         )
@@ -197,6 +197,16 @@ class ReconciliationTests(unittest.TestCase):
         unconfirmed_current = next(row for row in unconfirmed if row.period_start == "2026-01-01")
         self.assertTrue(any(issue.blocking for issue in mismatch_current.issues))
         self.assertIn("OPENING_BALANCE_MISSING", {issue.code for issue in unconfirmed_current.issues})
+
+    def test_prior_opening_cannot_use_an_unreconciled_predecessor(self) -> None:
+        """Catches a finite closing on an invalid predecessor unlocking a later period."""
+        rows = reconcile_all((), (
+            balance(period_start="2025-12-01", period_end="2025-12-31", opening_balance="90.00", closing_balance="101.00"),
+            balance(opening_balance="", closing_balance="100.00", opening_source_type="prior_year_end_statement", opening_source_location="2025-12-31"),
+        ))
+        current = next(row for row in rows if row.period_start == "2026-01-01")
+        self.assertFalse(current.reconciled)
+        self.assertIn("OPENING_BALANCE_MISSING", {issue.code for issue in current.issues})
 
     def test_truncated_and_overlong_balance_csv_are_blocking_not_unexpected(self) -> None:
         """Catches DictReader None cells escaping balance schema validation."""

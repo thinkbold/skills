@@ -248,6 +248,7 @@ def reconcile_all(
         balances_by_key.setdefault(key, []).append(row)
     continuity = validate_period_continuity(source_rows)
     output: list[ReconciliationRow] = []
+    verified_predecessors: dict[tuple[str, str, str], ReconciliationRow] = {}
     covered_units: set[tuple[str, str]] = set()
     for key in sorted(balances_by_key):
         account_id, currency, period_start, period_end = key
@@ -277,12 +278,10 @@ def reconcile_all(
         if source_type == "prior_year_end_statement" and confirmed is True:
             try:
                 prior_end = _date(period_start) - timedelta(days=1)
-                predecessors = [candidate for candidate in source_rows if candidate is not evidence and candidate.get("account_id") == account_id and candidate.get("currency") == currency and candidate.get("period_end") == prior_end.isoformat()]
-                if len(predecessors) != 1 or _confirmed(predecessors[0].get("confirmed", "")) is not True:
+                predecessor = verified_predecessors.get((account_id, currency, prior_end.isoformat()))
+                if predecessor is None or not predecessor.reconciled or predecessor.reported_closing is None:
                     raise ValueError
-                derived_opening = _balance_value(predecessors[0], "closing_balance")
-                if derived_opening is None:
-                    raise ValueError
+                derived_opening = predecessor.reported_closing
                 claimed = _balance_value(evidence, "opening_balance")
                 if claimed is not None and claimed != derived_opening:
                     local_issues.append(_blocking("BALANCE_EVIDENCE_INVALID", "Claimed opening balance contradicts confirmed predecessor closing."))
@@ -306,12 +305,14 @@ def reconcile_all(
         except ValueError:
             local_issues.append(_blocking("BALANCE_EVIDENCE_INVALID", "Transaction date is invalid for statement coverage."))
         local_issues.extend(issue for issue in continuity if f"{account_id}/{currency}" in issue.message)
-        output.append(reconcile_account_period(
+        reconciled_row = reconcile_account_period(
             account_id, currency, opening, (row.get("inflow", "0") for row in selected),
             (row.get("outflow", "0") for row in selected), closing, period_start, period_end,
             source_type, evidence.get("opening_source_location", "") if source_type == "prior_year_end_statement" else period_start,
             tolerance=tolerance, issues=local_issues,
-        ))
+        )
+        output.append(reconciled_row)
+        verified_predecessors[(account_id, currency, period_end)] = reconciled_row
     for (account_id, currency), unit_transactions in sorted(transactions_by_unit.items()):
         if (account_id, currency) in covered_units:
             ranges: list[tuple[date, date]] = []
