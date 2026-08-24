@@ -3,25 +3,29 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from difflib import SequenceMatcher
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import unicodedata
 from uuid import uuid4
 
 from .contracts import CANONICAL_TRANSACTION_FIELDS, Issue, MERCHANT_RULE_FIELDS
-from .storage import append_audit_event, atomic_write_csv, read_csv_rows, resolve_inside_ledger
+from .storage import append_audit_event, atomic_write_csv, atomic_write_json, read_audit_events, resolve_inside_ledger, sha256_file
 
 
 _CHART_FIELDS = ("account_code", "account_name", "active")
 _CANONICAL_PATH = Path("work") / "normalized-transactions.csv"
 _RULES_PATH = Path("merchant-rules.csv")
+_PENDING_OPERATION_PATH = Path("work") / "pending-classification-operation.json"
+_STAGED_TRANSACTIONS_PATH = Path("work") / "pending-classification-transactions.csv"
+_STAGED_RULES_PATH = Path("work") / "pending-classification-rules.csv"
 _DATE_PATTERN = re.compile(r"\b(?:19|20)\d{2}[/-](?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])\b")
-_TERMINAL_REFERENCE = re.compile(r"^(?=.*[A-Z])(?=.*\d)[A-Z0-9]{5,}$")
 
 
 @dataclass(frozen=True)
@@ -59,13 +63,19 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _validate_transaction_ids(transactions: tuple[dict[str, str], ...]) -> None:
+    ids = [row.get("transaction_id", "").strip() for row in transactions]
+    if any(not transaction_id for transaction_id in ids) or len(set(ids)) != len(ids):
+        raise ValueError("normalized transactions require unique non-empty transaction_id values")
+
+
 def normalize_merchant(value: str) -> str:
     """Conservatively normalize a description without stripping merchant words."""
-    text = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").upper()
+    text = unicodedata.normalize("NFKC", value).upper()
     text = _DATE_PATTERN.sub(" ", text)
-    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    text = "".join(character if character.isalnum() else " " for character in text)
     tokens = [token for token in text.split() if token]
-    while tokens and _TERMINAL_REFERENCE.fullmatch(tokens[-1]):
+    while tokens and len(tokens[-1]) >= 5 and all(character.isalnum() for character in tokens[-1]) and any(character.isalpha() for character in tokens[-1]) and any(character.isdigit() for character in tokens[-1]):
         tokens.pop()
     return " ".join(tokens)
 
@@ -140,7 +150,9 @@ def load_transactions(ledger_root: Path) -> tuple[dict[str, str], ...]:
         rows = list(reader)
     if any(set(row) != set(CANONICAL_TRANSACTION_FIELDS) for row in rows):
         raise ValueError("normalized transactions have unsupported columns")
-    return tuple(rows)
+    transactions = tuple(rows)
+    _validate_transaction_ids(transactions)
+    return transactions
 
 
 def save_transactions(ledger_root: Path, transactions: tuple[dict[str, str], ...]) -> None:
@@ -149,6 +161,7 @@ def save_transactions(ledger_root: Path, transactions: tuple[dict[str, str], ...
 
 def build_pending_groups(transactions: tuple[dict[str, str], ...]) -> tuple[MerchantGroup, ...]:
     """Build review questions by normalized merchant and direction, never by currency total."""
+    _validate_transaction_ids(transactions)
     grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
     for row in transactions:
         if row.get("classification_status", "unclassified") != "unclassified":
@@ -203,6 +216,7 @@ def _matching_rules(row: dict[str, str], rules: list[dict[str, str]]) -> list[di
 
 def apply_exact_rules(transactions: tuple[dict[str, str], ...], rules: list[dict[str, str]]) -> ClassificationResult:
     """Apply a single unambiguous active exact rule; fuzzy matching is deliberately absent."""
+    _validate_transaction_ids(transactions)
     output: list[dict[str, str]] = []
     issues: list[Issue] = []
     for source in transactions:
@@ -257,14 +271,101 @@ def _new_rule(merchant: str, direction: str, account_code: str, account_name: st
     }
 
 
-def confirm_group(ledger_root: Path, transactions: tuple[dict[str, str], ...], normalized_merchant: str, direction: str, account_code: str, account_name: str, apply_future: bool, actor: str) -> ClassificationResult:
+def _operation_key(kind: str, values: dict[str, object]) -> str:
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return f"classification:{kind}:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _completed_operation(ledger_root: Path, operation_key: str) -> str | None:
+    for event in read_audit_events(ledger_root):
+        if event.get("dedupe_key") == operation_key:
+            return str(event["event_id"])
+    return None
+
+
+def _install_staged_file(ledger_root: Path, staged_relative: Path, target_relative: Path, expected_hash: str) -> None:
+    staged = resolve_inside_ledger(ledger_root, staged_relative)
+    target = resolve_inside_ledger(ledger_root, target_relative)
+    if target.exists() and sha256_file(target) == expected_hash:
+        return
+    if not staged.exists() or sha256_file(staged) != expected_hash:
+        raise ValueError("pending classification operation cannot safely recover")
+    os.replace(staged, target)
+    if sha256_file(target) != expected_hash:
+        raise ValueError("pending classification operation wrote an unexpected target")
+
+
+def recover_pending_operation(ledger_root: Path) -> str | None:
+    """Complete a previously staged classification mutation exactly once."""
+    journal_path = resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH)
+    if not journal_path.exists():
+        return None
+    with journal_path.open("r", encoding="utf-8") as handle:
+        journal = json.load(handle)
+    required = {
+        "actor", "audit_event_id", "event_payload", "event_type", "operation_key",
+        "rules_sha256", "transactions_sha256",
+    }
+    if not isinstance(journal, dict) or set(journal) != required or not isinstance(journal["event_payload"], dict):
+        raise ValueError("pending classification operation is invalid")
+    _install_staged_file(ledger_root, _STAGED_TRANSACTIONS_PATH, _CANONICAL_PATH, str(journal["transactions_sha256"]))
+    _install_staged_file(ledger_root, _STAGED_RULES_PATH, _RULES_PATH, str(journal["rules_sha256"]))
+    event_id = append_audit_event(
+        ledger_root, str(journal["event_type"]), dict(journal["event_payload"]),
+        actor=str(journal["actor"]), dedupe_key=str(journal["operation_key"]), event_id=str(journal["audit_event_id"]),
+    )
+    if event_id != journal["audit_event_id"]:
+        raise ValueError("pending classification operation audit event does not match its journal")
+    journal_path.unlink()
+    resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH).unlink(missing_ok=True)
+    resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH).unlink(missing_ok=True)
+    return event_id
+
+
+def _completed_result(ledger_root: Path, event_id: str) -> ClassificationResult:
+    return ClassificationResult(load_transactions(ledger_root), audit_event_ids=(event_id,))
+
+
+def confirm_group(
+    ledger_root: Path,
+    transactions: tuple[dict[str, str], ...],
+    normalized_merchant: str,
+    direction: str,
+    account_code: str,
+    account_name: str,
+    apply_future: bool,
+    actor: str,
+    transaction_ids: tuple[str, ...] | None = None,
+) -> ClassificationResult:
     """Confirm current rows and optionally retain one ledger-local exact rule."""
+    recover_pending_operation(ledger_root)
+    _validate_transaction_ids(transactions)
     code, name = _validate_category(ledger_root, account_code, account_name)
     merchant = normalize_merchant(normalized_merchant)
-    selected_ids = tuple(sorted(row.get("transaction_id", "") for row in transactions if row.get("classification_status", "unclassified") == "unclassified" and _normalized(row) == merchant and _direction(row) == direction))
+    if transaction_ids is not None:
+        selected_ids = tuple(transaction_ids)
+    else:
+        selected_ids = tuple(row["transaction_id"] for row in sorted(
+            (row for row in transactions if row.get("classification_status", "unclassified") == "unclassified"
+             and _normalized(row) == merchant and _direction(row) == direction),
+            key=lambda row: (row.get("transaction_date", ""), row["transaction_id"]),
+        ))
     if not selected_ids:
         raise ValueError("group has no unclassified transactions")
-    event_id = append_audit_event(ledger_root, "merchant_group_confirmed", {"transaction_ids": list(selected_ids), "normalized_merchant_sha256": hashlib.sha256(merchant.encode()).hexdigest(), "direction": direction, "account_code": code, "apply_future": apply_future}, actor=actor, dedupe_key=f"merchant-confirm:{','.join(selected_ids)}:{code}:{name}:{apply_future}")
+    by_id = {row["transaction_id"]: row for row in transactions}
+    if len(selected_ids) != len(set(selected_ids)) or any(transaction_id not in by_id for transaction_id in selected_ids):
+        raise ValueError("group no longer matches its selected transactions")
+    selected = [by_id[transaction_id] for transaction_id in selected_ids]
+    if any(row.get("classification_status", "unclassified") != "unclassified" or _normalized(row) != merchant or _direction(row) != direction for row in selected):
+        raise ValueError("group no longer matches its selected transactions")
+    group_id = "merchant-" + hashlib.sha256((merchant + "\0" + direction + "\0" + "\0".join(selected_ids)).encode("utf-8")).hexdigest()[:16]
+    operation_key = _operation_key("confirm", {
+        "account_code": code, "account_name": name, "apply_future": apply_future,
+        "direction": direction, "merchant": merchant, "transaction_ids": tuple(sorted(selected_ids)),
+    })
+    completed = _completed_operation(ledger_root, operation_key)
+    if completed is not None:
+        return _completed_result(ledger_root, completed)
     existing = load_rules(ledger_root)
     created: tuple[dict[str, str], ...] = ()
     rule: dict[str, str] | None = None
@@ -273,9 +374,8 @@ def confirm_group(ledger_root: Path, transactions: tuple[dict[str, str], ...], n
         if matches:
             rule = matches[0]
         else:
-            rule = _new_rule(merchant, direction, code, name, event_id)
+            rule = _new_rule(merchant, direction, code, name, "PENDING")
             existing.append(rule)
-            _write_rules(ledger_root, existing)
             created = (rule,)
     output: list[dict[str, str]] = []
     for source in transactions:
@@ -283,35 +383,59 @@ def confirm_group(ledger_root: Path, transactions: tuple[dict[str, str], ...], n
         if item.get("transaction_id") in selected_ids:
             item.update({"normalized_merchant": merchant, "classification_status": "classified", "account_code": code, "account_name": name, "rule_id": rule["rule_id"] if rule else "", "review_note": ""})
         output.append(item)
+    event_payload = {
+        "transaction_ids": list(selected_ids), "normalized_merchant_sha256": hashlib.sha256(merchant.encode()).hexdigest(),
+        "direction": direction, "account_code": code, "account_name_sha256": hashlib.sha256(name.encode()).hexdigest(),
+        "apply_future": apply_future, "group_id": group_id,
+    }
+    event_id = uuid4().hex
+    if rule is not None and rule["audit_event_id"] == "PENDING":
+        rule["audit_event_id"] = event_id
+    # Stage with the preallocated audit ID so the rule and audit record are permanently linked.
+    transactions_path = resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH)
+    rules_path = resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH)
+    atomic_write_csv(transactions_path, CANONICAL_TRANSACTION_FIELDS, tuple(output))
+    atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, existing)
+    atomic_write_json(resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH), {
+        "actor": actor, "audit_event_id": event_id, "event_payload": event_payload,
+        "event_type": "merchant_group_confirmed", "operation_key": operation_key,
+        "rules_sha256": sha256_file(rules_path), "transactions_sha256": sha256_file(transactions_path),
+    })
+    recovered = recover_pending_operation(ledger_root)
+    if recovered != event_id:
+        raise ValueError("classification operation did not recover its audit event")
     return ClassificationResult(tuple(output), created_rules=created, audit_event_ids=(event_id,))
 
 
 def correct_transactions(ledger_root: Path, transactions: tuple[dict[str, str], ...], transaction_ids: tuple[str, ...], account_code: str, account_name: str, scope: str, actor: str) -> ClassificationResult:
     """Correct selected rows or replace a future exact rule without altering audit history."""
+    recover_pending_operation(ledger_root)
+    _validate_transaction_ids(transactions)
     if scope not in {"selected", "future_rule"}:
         raise ValueError("scope must be selected or future_rule")
     code, name = _validate_category(ledger_root, account_code, account_name)
-    selected = [row for row in transactions if row.get("transaction_id") in set(transaction_ids)]
-    if len(selected) != len(set(transaction_ids)):
+    requested_ids = tuple(sorted(transaction_ids))
+    if not requested_ids or len(requested_ids) != len(set(requested_ids)):
         raise ValueError("transaction ID must identify exactly one row")
-    if not selected:
-        raise ValueError("at least one transaction is required")
-    event_id = append_audit_event(
-        ledger_root,
-        "merchant_rule_replaced" if scope == "future_rule" else "merchant_classification_corrected",
-        {"transaction_ids": sorted(transaction_ids), "account_code": code, "scope": scope},
-        actor=actor,
-        dedupe_key=f"merchant-correct:{','.join(sorted(transaction_ids))}:{code}:{name}:{scope}",
-    )
+    selected = [row for row in transactions if row.get("transaction_id") in set(requested_ids)]
+    if len(selected) != len(requested_ids):
+        raise ValueError("transaction ID must identify exactly one row")
+    operation_key = _operation_key("correct", {
+        "account_code": code, "account_name": name, "scope": scope, "transaction_ids": requested_ids,
+    })
+    completed = _completed_operation(ledger_root, operation_key)
+    if completed is not None:
+        return _completed_result(ledger_root, completed)
     rule_id = ""
     created: tuple[dict[str, str], ...] = ()
+    rules = load_rules(ledger_root)
+    audit_event_id = uuid4().hex
     if scope == "future_rule":
         accounts = {row.get("account_id", "") for row in selected}
         merchants = {_normalized(row) for row in selected}
         directions = {_direction(row) for row in selected}
         if len(accounts) != 1 or len(merchants) != 1 or len(directions) != 1:
             raise ValueError("future_rule correction requires one merchant, direction, and account")
-        rules = load_rules(ledger_root)
         old_ids = {row.get("rule_id", "") for row in selected if row.get("rule_id")}
         candidates = [rule for rule in rules if rule.get("rule_id") in old_ids and rule.get("status") == "active"]
         if not candidates:
@@ -323,23 +447,37 @@ def correct_transactions(ledger_root: Path, transactions: tuple[dict[str, str], 
         old["status"] = "inactive"
         old["updated_at"] = _timestamp()
         replacement = _new_rule(
-            next(iter(merchants)), next(iter(directions)), code, name, event_id,
+            next(iter(merchants)), next(iter(directions)), code, name, audit_event_id,
             next(iter(accounts)) if confirmed_conflict else "",
         )
         rules.append(replacement)
-        _write_rules(ledger_root, rules)
         rule_id, created = replacement["rule_id"], (replacement,)
     output: list[dict[str, str]] = []
     for source in transactions:
         item = dict(source)
-        if item.get("transaction_id") in transaction_ids:
+        if item.get("transaction_id") in requested_ids:
             item.update({"normalized_merchant": _normalized(item), "classification_status": "classified", "account_code": code, "account_name": name, "rule_id": rule_id if scope == "future_rule" else item.get("rule_id", ""), "review_note": ""})
         output.append(item)
-    return ClassificationResult(tuple(output), created_rules=created, audit_event_ids=(event_id,))
+    event_payload = {"transaction_ids": list(requested_ids), "account_code": code, "scope": scope}
+    transactions_path = resolve_inside_ledger(ledger_root, _STAGED_TRANSACTIONS_PATH)
+    rules_path = resolve_inside_ledger(ledger_root, _STAGED_RULES_PATH)
+    atomic_write_csv(transactions_path, CANONICAL_TRANSACTION_FIELDS, tuple(output))
+    atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, rules)
+    atomic_write_json(resolve_inside_ledger(ledger_root, _PENDING_OPERATION_PATH), {
+        "actor": actor, "audit_event_id": audit_event_id, "event_payload": event_payload,
+        "event_type": "merchant_rule_replaced" if scope == "future_rule" else "merchant_classification_corrected",
+        "operation_key": operation_key, "rules_sha256": sha256_file(rules_path),
+        "transactions_sha256": sha256_file(transactions_path),
+    })
+    recovered = recover_pending_operation(ledger_root)
+    if recovered != audit_event_id:
+        raise ValueError("classification operation did not recover its audit event")
+    return ClassificationResult(tuple(output), created_rules=created, audit_event_ids=(audit_event_id,))
 
 
 def export_rules(ledger_root: Path, destination: str | Path) -> Path:
     """Export only the selected ledger's rule metadata to a ledger-contained CSV."""
+    recover_pending_operation(ledger_root)
     target = resolve_inside_ledger(ledger_root, destination)
     atomic_write_csv(target, MERCHANT_RULE_FIELDS, load_rules(ledger_root))
     return target
@@ -347,6 +485,7 @@ def export_rules(ledger_root: Path, destination: str | Path) -> Path:
 
 def deactivate_rule(ledger_root: Path, rule_id: str, actor: str) -> str:
     """Mark one active rule inactive and append an auditable lifecycle event."""
+    recover_pending_operation(ledger_root)
     rules = load_rules(ledger_root)
     matches = [rule for rule in rules if rule.get("rule_id") == rule_id]
     if len(matches) != 1:
@@ -360,6 +499,7 @@ def deactivate_rule(ledger_root: Path, rule_id: str, actor: str) -> str:
 
 def delete_rule(ledger_root: Path, rule_id: str, actor: str) -> str:
     """Remove the current rule row while retaining an append-only audit record."""
+    recover_pending_operation(ledger_root)
     rules = load_rules(ledger_root)
     kept = [rule for rule in rules if rule.get("rule_id") != rule_id]
     if len(kept) == len(rules):

@@ -7,6 +7,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ from bookkeeper.classification import (
     normalize_merchant,
     suggest_fuzzy_rules,
 )
+import bookkeeper.classification as classification
 from bookkeeper.contracts import CANONICAL_TRANSACTION_FIELDS, MERCHANT_RULE_FIELDS
 from bookkeeper.ledger import initialize_ledger
 from bookkeeper.storage import atomic_write_csv, read_audit_events, read_csv_rows
@@ -71,7 +73,13 @@ class ClassificationTests(unittest.TestCase):
         """Catches normalization keeping random terminal references or deleting merchant words."""
         self.assertEqual("OPENAI CHATGPT SUBSCRIPTION", normalize_merchant("OPENAI *CHATGPT SUBSCRIPTION 9F3A2"))
         self.assertEqual("OPENAI CHATGPT SUBSCRIPTION", normalize_merchant("OPENAI *CHATGPT SUBSCRIPTION 7H4K9"))
-        self.assertEqual("CAFE 2026 MARKET", normalize_merchant("Caf\u00e9 2026 Market"))
+        self.assertEqual("CAFÉ 2026 MARKET", normalize_merchant("Caf\u00e9 2026 Market"))
+
+    def test_normalization_preserves_non_latin_merchant_words_for_grouping(self) -> None:
+        """Catches normalization deleting meaningful non-Latin merchant names."""
+        japanese = row("jp", "checking", "CAD", "株式会社 テスト 9F3A2", "20.00", "2026-01-08")
+        self.assertEqual("株式会社 テスト", normalize_merchant(japanese["raw_description"]))
+        self.assertEqual("株式会社 テスト", build_pending_groups((japanese,))[0].normalized_merchant)
 
     def test_pending_group_keeps_currency_totals_separate(self) -> None:
         """Catches a merchant review question combining CAD and USD into one monetary total."""
@@ -104,6 +112,23 @@ class ClassificationTests(unittest.TestCase):
         repeated = confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
         self.assertEqual((), repeated.created_rules)
         self.assertEqual(1, len(load_rules(self.ledger)))
+
+    def test_confirmation_blocks_duplicate_ids_before_audit_or_rule_changes(self) -> None:
+        """Catches a colliding transaction ID widening a confirmation to an unrelated row."""
+        collision = row("cad-openai", "other", "CAD", "OTHER SYNTHETIC MERCHANT", "40.00", "2026-01-09")
+        with self.assertRaisesRegex(ValueError, "unique non-empty transaction_id"):
+            confirm_group(self.ledger, self.openai_rows + (collision,), "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        self.assertEqual([], load_rules(self.ledger))
+        self.assertEqual([], [event for event in read_audit_events(self.ledger) if event["event_type"] != "ledger_initialized"])
+
+    def test_confirmation_rejects_a_stale_group_member_before_mutation(self) -> None:
+        """Catches a stale pending group classifying a row no longer in its merchant/direction/status set."""
+        group = build_pending_groups(self.openai_rows)[0]
+        stale = (self.openai_rows[0], {**self.openai_rows[1], "classification_status": "classified"})
+        with self.assertRaisesRegex(ValueError, "group no longer matches"):
+            confirm_group(self.ledger, stale, group.normalized_merchant, group.direction, "6100", "Membership Fee", True, "user", group.transaction_ids)
+        self.assertEqual([], load_rules(self.ledger))
+        self.assertEqual([], [event for event in read_audit_events(self.ledger) if event["event_type"] != "ledger_initialized"])
 
     def test_rules_and_chart_are_ledger_local(self) -> None:
         """Catches classification memory or a chart leaking into another company ledger."""
@@ -163,6 +188,64 @@ class ClassificationTests(unittest.TestCase):
         event_types = [event["event_type"] for event in read_audit_events(self.ledger)]
         self.assertIn("merchant_rule_deactivated", event_types)
         self.assertIn("merchant_rule_deleted", event_types)
+
+    def test_future_rule_retry_is_idempotent_and_invalid_precondition_leaves_no_audit(self) -> None:
+        """Catches retrying a successful correction replacing another rule or auditing a rejected correction."""
+        confirmed = confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        first = correct_transactions(self.ledger, confirmed.transactions, ("cad-openai",), "6200", "Software", "future_rule", "user")
+        repeated = correct_transactions(self.ledger, first.transactions, ("cad-openai",), "6200", "Software", "future_rule", "user")
+        self.assertEqual((), repeated.created_rules)
+        self.assertEqual(1, len([rule for rule in load_rules(self.ledger) if rule["status"] == "active"]))
+        before = list(read_audit_events(self.ledger))
+        with self.assertRaisesRegex(ValueError, "one matching active rule"):
+            correct_transactions(self.ledger, (self.fuzzy_row,), ("fuzzy",), "6200", "Software", "future_rule", "user")
+        self.assertEqual(before, read_audit_events(self.ledger))
+
+    def test_interrupted_confirmation_recovers_rows_rules_and_one_audit_event(self) -> None:
+        """Catches an interruption leaving a rule/audit without the corresponding classified rows."""
+        with patch("bookkeeper.classification._install_staged_file", side_effect=OSError("synthetic interruption")):
+            with self.assertRaisesRegex(OSError, "synthetic interruption"):
+                confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        self.assertEqual([], [event for event in read_audit_events(self.ledger) if event["event_type"] != "ledger_initialized"])
+        recovered = confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        self.assertEqual({"classified"}, {item["classification_status"] for item in recovered.transactions})
+        self.assertEqual(1, len(load_rules(self.ledger)))
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_group_confirmed"]))
+        self.assertEqual(0, len(recovered.created_rules))
+
+    def test_interrupted_correction_after_rows_install_recovers_one_replacement(self) -> None:
+        """Catches a correction installing rows before rules and then replaying a second replacement."""
+        confirmed = confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        original_install = classification._install_staged_file
+        calls = 0
+
+        def interrupt_after_rows(*args: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("synthetic rules interruption")
+            original_install(*args)  # type: ignore[arg-type]
+
+        with patch("bookkeeper.classification._install_staged_file", side_effect=interrupt_after_rows):
+            with self.assertRaisesRegex(OSError, "synthetic rules interruption"):
+                correct_transactions(self.ledger, confirmed.transactions, ("cad-openai",), "6200", "Software", "future_rule", "user")
+        recovered = correct_transactions(self.ledger, confirmed.transactions, ("cad-openai",), "6200", "Software", "future_rule", "user")
+        self.assertEqual((), recovered.created_rules)
+        self.assertEqual("6200", next(item for item in recovered.transactions if item["transaction_id"] == "cad-openai")["account_code"])
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_replaced"]))
+        self.assertEqual(1, len([rule for rule in load_rules(self.ledger) if rule["status"] == "active"]))
+
+    def test_confirm_cli_returns_completed_operation_after_recovery_removes_pending_group(self) -> None:
+        """Catches CLI recovery completing a confirmation and then rejecting its identical retry as missing."""
+        atomic_write_csv(self.ledger / "work" / "normalized-transactions.csv", CANONICAL_TRANSACTION_FIELDS, self.openai_rows)
+        group = build_pending_groups(self.openai_rows)[0]
+        with patch("bookkeeper.classification._install_staged_file", side_effect=OSError("synthetic interruption")):
+            with self.assertRaisesRegex(OSError, "synthetic interruption"):
+                confirm_group(self.ledger, self.openai_rows, group.normalized_merchant, group.direction, "6100", "Membership Fee", True, "user", group.transaction_ids)
+        command = [sys.executable, str(SKILL_ROOT / "scripts" / "classify_transactions.py"), "confirm", str(self.ledger), group.group_id, "--account-code", "6100", "--account-name", "Membership Fee", "--apply-future", "--actor", "user"]
+        completed = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(1, len([event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_group_confirmed"]))
 
     def test_export_and_non_pending_outputs_do_not_contain_descriptions(self) -> None:
         """Catches raw statement descriptions escaping through rule export or audit records."""
