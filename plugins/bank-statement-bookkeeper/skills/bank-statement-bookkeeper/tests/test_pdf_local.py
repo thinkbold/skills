@@ -73,6 +73,55 @@ class PdfLocalTests(unittest.TestCase):
         self.assertEqual((), result.issues)
         self.assertEqual(b"%PDF", (FIXTURES / "scanned-statement.pdf").read_bytes()[:4])
 
+    def test_ocr_rejects_every_staging_symlink_before_invoking_the_runner(self) -> None:
+        """Catches OCR following a staging ancestor or destination symlink outside the work area."""
+        source = FIXTURES / "scanned-statement.pdf"
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        cases = ("pdf-ocr", "hash-directory", "destination-file")
+        for case in cases:
+            with self.subTest(case=case):
+                work = self.work / case / "work"
+                outside = self.work / case / "outside"
+                work.mkdir(parents=True)
+                outside.mkdir()
+                destination_name = f"{source.stem}-searchable.pdf"
+                if case == "pdf-ocr":
+                    (work / "pdf-ocr").symlink_to(outside, target_is_directory=True)
+                elif case == "hash-directory":
+                    (work / "pdf-ocr").mkdir()
+                    (work / "pdf-ocr" / source_hash).symlink_to(outside, target_is_directory=True)
+                else:
+                    destination = work / "pdf-ocr" / source_hash / destination_name
+                    destination.parent.mkdir(parents=True)
+                    (outside / "sentinel.pdf").write_bytes(b"outside-sentinel")
+                    destination.symlink_to(outside / "sentinel.pdf")
+
+                invocations: list[Path] = []
+
+                def unsafe_runner(_source: Path, staged: Path, _executable: str) -> Path:
+                    invocations.append(staged)
+                    staged.write_bytes(b"statement-derived-bytes")
+                    return staged
+
+                before = {
+                    path.relative_to(outside).as_posix(): path.read_bytes()
+                    for path in outside.rglob("*") if path.is_file()
+                }
+                result = extract_pdf_pages(
+                    source,
+                    work,
+                    PdfCapabilities(pdfplumber=True, ocrmypdf="/usr/bin/ocrmypdf"),
+                    ocr_runner=unsafe_runner,
+                )
+
+                after = {
+                    path.relative_to(outside).as_posix(): path.read_bytes()
+                    for path in outside.rglob("*") if path.is_file()
+                }
+                self.assertEqual("LOCAL_OCR_FAILED", result.issues[0].code)
+                self.assertEqual([], invocations)
+                self.assertEqual(before, after)
+
     def test_scanned_fixture_is_same_synthetic_page_as_an_image_only_pdf(self) -> None:
         """Catches committing a placeholder image instead of the rasterized synthetic statement."""
         with pdfplumber.open(FIXTURES / "scanned-statement.pdf") as document:

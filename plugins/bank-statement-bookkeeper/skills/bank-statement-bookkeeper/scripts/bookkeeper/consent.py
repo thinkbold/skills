@@ -51,9 +51,12 @@ class ExternalProcessingProposal:
     pages: tuple[int, ...]
     fields: tuple[str, ...]
     sensitive_data: tuple[str, ...]
+    purpose: str
     retention_risk: str
     training_risk: str
     regional_risk: str
+    human_access_risk: str
+    subprocessor_access_risk: str
     redactions: tuple[str, ...]
     manual_alternative: str
 
@@ -84,11 +87,8 @@ def _pages(value: object) -> tuple[int, ...]:
     return pages
 
 
-def _operation_id(provider: str, source_hash: str, pages: tuple[int, ...], fields: tuple[str, ...], nonce: str) -> str:
-    basis = json.dumps({
-        "provider": provider, "source_hash": source_hash, "pages": pages,
-        "fields": fields, "nonce": nonce,
-    }, sort_keys=True, separators=(",", ":"))
+def _operation_id(disclosure: Mapping[str, object]) -> str:
+    basis = json.dumps(disclosure, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
@@ -99,9 +99,12 @@ def _normalized_proposal(
     pages: object,
     fields: object,
     sensitive_data: object,
+    purpose: object,
     retention_risk: object,
     training_risk: object,
     regional_risk: object,
+    human_access_risk: object,
+    subprocessor_access_risk: object,
     redactions: object,
     manual_alternative: object,
     nonce: object,
@@ -118,23 +121,26 @@ def _normalized_proposal(
     normalized_fields = _text_tuple(fields, "fields")
     if set(normalized_fields).difference(_FIELD_REQUIREMENTS):
         raise ValueError("proposal fields are not supported")
-    expected_operation_id = _operation_id(provider_text, hash_text, normalized_pages, normalized_fields, nonce_text)
+    normalized = {
+        "nonce": nonce_text,
+        "provider": provider_text,
+        "source_hash": hash_text,
+        "pages": normalized_pages,
+        "fields": normalized_fields,
+        "sensitive_data": _text_tuple(sensitive_data, "sensitive_data"),
+        "purpose": _required_text(purpose, "purpose"),
+        "retention_risk": _required_text(retention_risk, "retention_risk"),
+        "training_risk": _required_text(training_risk, "training_risk"),
+        "regional_risk": _required_text(regional_risk, "regional_risk"),
+        "human_access_risk": _required_text(human_access_risk, "human_access_risk"),
+        "subprocessor_access_risk": _required_text(subprocessor_access_risk, "subprocessor_access_risk"),
+        "redactions": _text_tuple(redactions, "redactions"),
+        "manual_alternative": _required_text(manual_alternative, "manual_alternative"),
+    }
+    expected_operation_id = _operation_id(normalized)
     if operation_id is not None and _required_text(operation_id, "operation_id").lower() != expected_operation_id:
         raise ValueError("proposal operation_id does not match its disclosed scope")
-    return ExternalProcessingProposal(
-        operation_id=expected_operation_id,
-        nonce=nonce_text,
-        provider=provider_text,
-        source_hash=hash_text,
-        pages=normalized_pages,
-        fields=normalized_fields,
-        sensitive_data=_text_tuple(sensitive_data, "sensitive_data"),
-        retention_risk=_required_text(retention_risk, "retention_risk"),
-        training_risk=_required_text(training_risk, "training_risk"),
-        regional_risk=_required_text(regional_risk, "regional_risk"),
-        redactions=_text_tuple(redactions, "redactions"),
-        manual_alternative=_required_text(manual_alternative, "manual_alternative"),
-    )
+    return ExternalProcessingProposal(operation_id=expected_operation_id, **normalized)
 
 
 def create_external_proposal(
@@ -144,17 +150,22 @@ def create_external_proposal(
     pages: tuple[int, ...] | list[int],
     fields: tuple[str, ...] | list[str],
     sensitive_data: tuple[str, ...] | list[str],
+    purpose: str,
     retention_risk: str,
     training_risk: str,
     regional_risk: str,
+    human_access_risk: str,
+    subprocessor_access_risk: str,
     redactions: tuple[str, ...] | list[str],
     manual_alternative: str,
 ) -> ExternalProcessingProposal:
     """Create one non-reusable disclosure for one proposed external operation."""
     return _normalized_proposal(
         provider=provider, source_hash=source_hash, pages=pages, fields=fields,
-        sensitive_data=sensitive_data, retention_risk=retention_risk, training_risk=training_risk,
-        regional_risk=regional_risk, redactions=redactions, manual_alternative=manual_alternative,
+        sensitive_data=sensitive_data, purpose=purpose, retention_risk=retention_risk,
+        training_risk=training_risk, regional_risk=regional_risk,
+        human_access_risk=human_access_risk, subprocessor_access_risk=subprocessor_access_risk,
+        redactions=redactions, manual_alternative=manual_alternative,
         nonce=uuid4().hex,
     )
 
@@ -172,8 +183,10 @@ def proposal_from_dict(payload: Mapping[str, object]) -> ExternalProcessingPropo
         return create_external_proposal(
             provider=payload.get("provider", ""), source_hash=payload.get("source_hash", ""),
             pages=payload.get("pages", ()), fields=payload.get("fields", ()),
-            sensitive_data=payload.get("sensitive_data", ()), retention_risk=payload.get("retention_risk", ""),
-            training_risk=payload.get("training_risk", ""), regional_risk=payload.get("regional_risk", ""),
+            sensitive_data=payload.get("sensitive_data", ()), purpose=payload.get("purpose", ""),
+            retention_risk=payload.get("retention_risk", ""), training_risk=payload.get("training_risk", ""),
+            regional_risk=payload.get("regional_risk", ""), human_access_risk=payload.get("human_access_risk", ""),
+            subprocessor_access_risk=payload.get("subprocessor_access_risk", ""),
             redactions=payload.get("redactions", ()), manual_alternative=payload.get("manual_alternative", ""),
         )
     if operation_id is None or nonce is None:
@@ -181,27 +194,33 @@ def proposal_from_dict(payload: Mapping[str, object]) -> ExternalProcessingPropo
     return _normalized_proposal(
         provider=payload.get("provider", ""), source_hash=payload.get("source_hash", ""),
         pages=payload.get("pages", ()), fields=payload.get("fields", ()),
-        sensitive_data=payload.get("sensitive_data", ()), retention_risk=payload.get("retention_risk", ""),
-        training_risk=payload.get("training_risk", ""), regional_risk=payload.get("regional_risk", ""),
+        sensitive_data=payload.get("sensitive_data", ()), purpose=payload.get("purpose", ""),
+        retention_risk=payload.get("retention_risk", ""), training_risk=payload.get("training_risk", ""),
+        regional_risk=payload.get("regional_risk", ""), human_access_risk=payload.get("human_access_risk", ""),
+        subprocessor_access_risk=payload.get("subprocessor_access_risk", ""),
         redactions=payload.get("redactions", ()), manual_alternative=payload.get("manual_alternative", ""),
         nonce=nonce, operation_id=operation_id,
     )
 
 
-def _scope_payload(proposal: ExternalProcessingProposal) -> dict[str, object]:
-    """Return the non-sensitive exact scope retained in append-only audit."""
+def proposal_disclosure_digest(proposal: ExternalProcessingProposal) -> str:
+    """Bind every normalized disclosure field without retaining its sensitive text in audit."""
     disclosure = proposal_to_dict(proposal)
     disclosure.pop("operation_id")
-    disclosure_digest = hashlib.sha256(
+    return hashlib.sha256(
         json.dumps(disclosure, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _scope_payload(proposal: ExternalProcessingProposal) -> dict[str, object]:
+    """Return the non-sensitive exact scope retained in append-only audit."""
     return {
         "operation_id": proposal.operation_id,
         "provider": proposal.provider,
         "source_hash": proposal.source_hash,
         "pages": list(proposal.pages),
         "fields": list(proposal.fields),
-        "disclosure_digest": disclosure_digest,
+        "disclosure_digest": proposal_disclosure_digest(proposal),
     }
 
 
@@ -270,6 +289,7 @@ class _AuthorizedScope:
     source_hash: str
     pages: tuple[int, ...]
     fields: tuple[str, ...]
+    disclosure_digest: str
 
 
 def _authorized_scope(ledger_root: Path, consent_id: str) -> _AuthorizedScope | None:
@@ -281,9 +301,21 @@ def _authorized_scope(ledger_root: Path, consent_id: str) -> _AuthorizedScope | 
         operation_id = _required_text(payload.get("operation_id", ""), "operation_id")
         provider = _required_text(payload.get("provider", ""), "provider")
         source_hash = _required_text(payload.get("source_hash", ""), "source_hash").lower()
-        if not _HASH.fullmatch(operation_id) or not _HASH.fullmatch(source_hash):
+        disclosure_digest = _required_text(payload.get("disclosure_digest", ""), "disclosure_digest").lower()
+        if (
+            not _HASH.fullmatch(operation_id)
+            or not _HASH.fullmatch(source_hash)
+            or not _HASH.fullmatch(disclosure_digest)
+        ):
             return None
-        scope = _AuthorizedScope(operation_id, provider, source_hash, _pages(payload.get("pages", ())), _text_tuple(payload.get("fields", ()), "fields"))
+        scope = _AuthorizedScope(
+            operation_id,
+            provider,
+            source_hash,
+            _pages(payload.get("pages", ())),
+            _text_tuple(payload.get("fields", ()), "fields"),
+            disclosure_digest,
+        )
     except ValueError:
         return None
     # Compare the selected and current decision by stored exact scope, without

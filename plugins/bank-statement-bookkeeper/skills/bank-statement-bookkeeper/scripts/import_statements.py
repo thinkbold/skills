@@ -22,6 +22,7 @@ from bookkeeper.classification import (
 )
 from bookkeeper.consent import (
     admit_external_result,
+    proposal_disclosure_digest,
     proposal_from_dict,
     proposal_to_dict,
     record_external_decision,
@@ -125,8 +126,7 @@ _CORRECTION_RECORD_FIELDS = {
 }
 _CORRECTABLE_FIELDS = {
     "transaction_date", "posting_date", "inflow", "outflow", "running_balance",
-    "reference", "normalized_merchant", "classification_status", "account_code",
-    "account_name", "rule_id",
+    "reference", "normalized_merchant",
 }
 _SELECTED_CLASSIFICATION_EVENTS = {
     "merchant_group_confirmed", "merchant_classification_corrected", "merchant_rule_replaced",
@@ -682,14 +682,17 @@ def _read_proposal(ledger_root: Path, requested: str):
 def _propose_external(ledger_root: Path, proposal_file: str) -> dict[str, object]:
     path, proposal = _read_proposal(ledger_root, proposal_file)
     atomic_write_json(path, proposal_to_dict(proposal))
-    return proposal_to_dict(proposal)
+    return {**proposal_to_dict(proposal), "disclosure_digest": proposal_disclosure_digest(proposal)}
 
 
 def _record_consent(ledger_root: Path, args: argparse.Namespace) -> dict[str, object]:
     _, proposal = _read_proposal(ledger_root, args.proposal)
+    disclosure_digest = proposal_disclosure_digest(proposal)
+    if args.disclosure_digest != disclosure_digest:
+        raise ValueError("recorded decision disclosure digest does not match the predecision disclosure")
     consent_id = record_external_decision(ledger_root, proposal, args.decision == "authorized", args.actor)
     return {
-        "consent_id": consent_id, "disclosure": proposal_to_dict(proposal),
+        "consent_id": consent_id, "disclosure_digest": disclosure_digest,
         "status": "authorized" if args.decision == "authorized" else "declined",
     }
 
@@ -746,6 +749,7 @@ def _parser() -> argparse.ArgumentParser:
     consent.add_argument("proposal")
     consent.add_argument("--decision", required=True, choices=("authorized", "declined"))
     consent.add_argument("--actor", required=True)
+    consent.add_argument("--disclosure-digest", required=True)
     external_result = commands.add_parser("external-result")
     external_result.add_argument("ledger_dir", type=Path)
     external_result.add_argument("result", type=Path)

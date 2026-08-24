@@ -15,7 +15,14 @@ from typing import Iterable
 from uuid import uuid4
 
 from .contracts import CANONICAL_TRANSACTION_FIELDS, AccountContext, ImportResult, Issue
-from .storage import append_audit_event, atomic_write_csv, atomic_write_json, resolve_inside_ledger, sha256_file
+from .storage import (
+    append_audit_event,
+    atomic_write_csv,
+    atomic_write_json,
+    read_audit_events,
+    resolve_inside_ledger,
+    sha256_file,
+)
 
 
 _MONEY_FIELDS = frozenset({"inflow", "outflow", "running_balance"})
@@ -25,8 +32,15 @@ _PROVENANCE_FIELDS = frozenset({
 })
 _EDITABLE_FIELDS = frozenset({
     "transaction_date", "posting_date", "inflow", "outflow", "running_balance",
-    "reference", "normalized_merchant", "classification_status", "account_code",
-    "account_name", "rule_id",
+    "reference", "normalized_merchant",
+})
+_CORRECTION_RECORD_FIELDS = frozenset({
+    "actor", "corrected_value", "event_id", "field_name", "original_value",
+    "reason", "timestamp", "transaction_id",
+})
+_CORRECTION_AUDIT_FIELDS = frozenset({
+    "corrected_value_sha256", "field_name", "original_value_sha256",
+    "reason_sha256", "transaction_id",
 })
 _MASKED_LABEL = re.compile(r"^\*+[^\d]*\d{4}$")
 
@@ -103,9 +117,17 @@ def account_context_issue(account: AccountContext) -> Issue | None:
     if not all(value.strip() for value in (
         account.account_id, account.institution, account.masked_label, account.currency,
     )):
-        return Issue("ACCOUNT_UNCONFIRMED", "A confirmed account context is required.")
+        return Issue(
+            code="ACCOUNT_UNCONFIRMED",
+            message="A confirmed account context is required.",
+            blocking=True,
+        )
     if not _MASKED_LABEL.fullmatch(account.masked_label):
-        return Issue("ACCOUNT_UNCONFIRMED", "Account labels must be explicitly masked before import.")
+        return Issue(
+            code="ACCOUNT_UNCONFIRMED",
+            message="Account labels must be explicitly masked before import.",
+            blocking=True,
+        )
     return None
 
 
@@ -188,19 +210,37 @@ def normalize_csv_statement(
     logical_source = source_identity or source.name
     if not account.currency.strip():
         return ImportResult(
-            issues=(Issue("CURRENCY_MISSING", "A currency is required for each import.", logical_source),),
+            issues=(Issue(
+                code="CURRENCY_MISSING",
+                message="A currency is required for each import.",
+                blocking=True,
+                source_file=logical_source,
+            ),),
             source_hashes={logical_source: source_hash},
         )
     account_issue = account_context_issue(account)
     if account_issue is not None:
-        return ImportResult(issues=(account_issue,), source_hashes={logical_source: source_hash})
+        return ImportResult(
+            issues=(Issue(
+                code=account_issue.code,
+                message=account_issue.message,
+                blocking=account_issue.blocking,
+                source_file=logical_source,
+            ),),
+            source_hashes={logical_source: source_hash},
+        )
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fieldnames = tuple(reader.fieldnames or ())
         missing = [header for header in _mapping_headers(mapping) if header not in fieldnames]
         if missing:
             return ImportResult(
-                issues=(Issue("CSV_HEADER_MISSING", f"CSV header missing: {', '.join(missing)}", logical_source),),
+                issues=(Issue(
+                    code="CSV_HEADER_MISSING",
+                    message=f"CSV header missing: {', '.join(missing)}",
+                    blocking=True,
+                    source_file=logical_source,
+                ),),
                 source_hashes={logical_source: source_hash},
             )
         rows: list[dict[str, str]] = []
@@ -209,9 +249,21 @@ def normalize_csv_statement(
             try:
                 rows.append(_canonical_row(source, logical_source, source_hash, source_row, raw, mapping, account))
             except _AmountError as error:
-                issues.append(Issue(error.code, str(error), logical_source, str(source_row)))
+                issues.append(Issue(
+                    code=error.code,
+                    message=str(error),
+                    blocking=True,
+                    source_file=logical_source,
+                    source_location=str(source_row),
+                ))
             except ValueError as error:
-                issues.append(Issue("DATE_UNPARSEABLE", str(error), logical_source, str(source_row)))
+                issues.append(Issue(
+                    code="DATE_UNPARSEABLE",
+                    message=str(error),
+                    blocking=True,
+                    source_file=logical_source,
+                    source_location=str(source_row),
+                ))
         if issues:
             return ImportResult(issues=tuple(issues), source_hashes={logical_source: source_hash})
     return ImportResult(transactions=tuple(rows), source_hashes={logical_source: source_hash})
@@ -228,8 +280,9 @@ def discover_account_candidates(inventories: tuple[StatementInventory, ...]) -> 
         issues: tuple[Issue, ...] = ()
         if not all(identity) or not _MASKED_LABEL.fullmatch(masked_label):
             issues = (Issue(
-                "ACCOUNT_IDENTITY_AMBIGUOUS",
-                "Institution, masked account label, and currency are required for confirmation.",
+                code="ACCOUNT_IDENTITY_AMBIGUOUS",
+                message="Institution, masked account label, and currency are required for confirmation.",
+                blocking=True,
             ),)
         candidates.append(AccountCandidate(
             institution=institution,
@@ -335,6 +388,58 @@ def _correction_recorded(ledger_root: Path, event_id: str) -> bool:
         )
 
 
+def _validate_pending_correction_outputs(
+    ledger_root: Path,
+    event_id: str,
+    audit_payload: dict[str, str],
+    correction_record: dict[str, str],
+) -> None:
+    """Fail closed on conflicting exactly-once outputs before recovery mutates state."""
+    dedupe_key = f"manual-correction:{event_id}"
+    related_events = [
+        event for event in read_audit_events(ledger_root)
+        if event.get("event_id") == event_id or event.get("dedupe_key") == dedupe_key
+    ]
+    if len(related_events) > 1:
+        raise ValueError("pending correction audit state is invalid")
+    if related_events:
+        event = related_events[0]
+        if (
+            set(event) != {"actor", "dedupe_key", "event_id", "event_type", "payload", "timestamp"}
+            or event.get("event_id") != event_id
+            or event.get("dedupe_key") != dedupe_key
+            or event.get("event_type") != "manual_correction_recorded"
+            or event.get("actor") != correction_record["actor"]
+            or event.get("payload") != audit_payload
+        ):
+            raise ValueError("pending correction audit state is invalid")
+    corrections_path = resolve_inside_ledger(ledger_root, Path("work") / "corrections.jsonl")
+    matching_records: list[dict[str, str]] = []
+    try:
+        if corrections_path.exists():
+            with corrections_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    loaded = json.loads(line)
+                    if (
+                        not isinstance(loaded, dict)
+                        or set(loaded) != _CORRECTION_RECORD_FIELDS
+                        or not all(isinstance(value, str) for value in loaded.values())
+                    ):
+                        raise ValueError
+                    if loaded["event_id"] == event_id:
+                        matching_records.append(loaded)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("pending correction record state is invalid") from error
+    if len(matching_records) > 1 or (
+        matching_records and matching_records[0] != correction_record
+    ):
+        raise ValueError("pending correction record state is invalid")
+    if matching_records and not related_events:
+        raise ValueError("pending correction record lacks its audit event")
+
+
 def _validate_correction(field_name: str, corrected_value: str, row: dict[str, str]) -> str:
     if field_name == "raw_description":
         raise ValueError("raw_description is immutable")
@@ -342,6 +447,8 @@ def _validate_correction(field_name: str, corrected_value: str, row: dict[str, s
         raise ValueError("provenance fields are immutable")
     if field_name not in _EDITABLE_FIELDS:
         raise ValueError(f"field is not manually correctable: {field_name}")
+    if field_name == "normalized_merchant" and row.get("classification_status") != "unclassified":
+        raise ValueError("normalized_merchant is correctable only on an unclassified row")
     if field_name in {"transaction_date", "posting_date"}:
         corrected_value = _parse_date(corrected_value, ("%Y-%m-%d",))
     elif field_name in _MONEY_FIELDS:
@@ -440,13 +547,77 @@ def validate_pending_correction(ledger_root: Path) -> None:
         raise ValueError("pending correction journal is invalid")
     if journal["canonical_relative_path"] != str(_CANONICAL_RELATIVE_PATH) or journal["staged_relative_path"] != str(_STAGED_CORRECTION_RELATIVE_PATH):
         raise ValueError("pending correction journal is invalid")
-    staged = resolve_inside_ledger(ledger_root, _STAGED_CORRECTION_RELATIVE_PATH)
-    if not staged.is_file() or sha256_file(staged) != journal["expected_canonical_sha256"]:
+    record, payload = journal["correction_record"], journal["audit_payload"]
+    if (
+        set(record) != _CORRECTION_RECORD_FIELDS
+        or set(payload) != _CORRECTION_AUDIT_FIELDS
+        or not all(isinstance(value, str) for value in record.values())
+        or not all(isinstance(value, str) for value in payload.values())
+        or record["event_id"] != journal["event_id"]
+        or record["field_name"] not in _EDITABLE_FIELDS
+        or payload["field_name"] != record["field_name"]
+        or payload["transaction_id"] != record["transaction_id"]
+        or payload["corrected_value_sha256"] != hashlib.sha256(record["corrected_value"].encode("utf-8")).hexdigest()
+        or payload["original_value_sha256"] != hashlib.sha256(record["original_value"].encode("utf-8")).hexdigest()
+        or payload["reason_sha256"] != hashlib.sha256(record["reason"].encode("utf-8")).hexdigest()
+    ):
         raise ValueError("pending correction journal is invalid")
     current = resolve_inside_ledger(ledger_root, _CANONICAL_RELATIVE_PATH)
     current_hash = sha256_file(current) if current.exists() else ""
     if current_hash not in {journal["base_canonical_sha256"], journal["expected_canonical_sha256"]}:
         raise ValueError("pending correction conflicts with current ledger state")
+    staged = resolve_inside_ledger(ledger_root, _STAGED_CORRECTION_RELATIVE_PATH)
+    staged_rows: tuple[dict[str, str], ...] | None = None
+    try:
+        if staged.is_file():
+            if sha256_file(staged) != journal["expected_canonical_sha256"]:
+                raise ValueError
+            with staged.open("r", encoding="utf-8", newline="") as handle:
+                staged_reader = csv.DictReader(handle)
+                staged_rows = tuple(staged_reader)
+                if tuple(staged_reader.fieldnames or ()) != CANONICAL_TRANSACTION_FIELDS or any(
+                    None in row or set(row) != set(CANONICAL_TRANSACTION_FIELDS) for row in staged_rows
+                ):
+                    raise ValueError
+        elif current_hash != journal["expected_canonical_sha256"]:
+            raise ValueError
+        with current.open("r", encoding="utf-8", newline="") as handle:
+            current_reader = csv.DictReader(handle)
+            current_rows = tuple(current_reader)
+            if tuple(current_reader.fieldnames or ()) != CANONICAL_TRANSACTION_FIELDS or any(
+                None in row or set(row) != set(CANONICAL_TRANSACTION_FIELDS) for row in current_rows
+            ):
+                raise ValueError
+    except (OSError, csv.Error, UnicodeError, ValueError) as error:
+        raise ValueError("pending correction journal is invalid") from error
+    if current_hash == journal["base_canonical_sha256"]:
+        if staged_rows is None:
+            raise ValueError("pending correction journal is invalid")
+        matches = [row for row in current_rows if row["transaction_id"] == record["transaction_id"]]
+        if len(matches) != 1 or matches[0][record["field_name"]] != record["original_value"]:
+            raise ValueError("pending correction journal is invalid")
+        corrected = _validate_correction(record["field_name"], record["corrected_value"], matches[0])
+        expected_rows = _corrected_rows(
+            current_rows, record["transaction_id"], record["field_name"], corrected, record["event_id"],
+        )
+        if corrected != record["corrected_value"] or staged_rows != expected_rows:
+            raise ValueError("pending correction journal is invalid")
+    else:
+        matches = [row for row in current_rows if row["transaction_id"] == record["transaction_id"]]
+        if (
+            len(matches) != 1
+            or matches[0][record["field_name"]] != record["corrected_value"]
+            or matches[0]["review_note"] != record["event_id"]
+            or (staged_rows is not None and staged_rows != current_rows)
+        ):
+            raise ValueError("pending correction journal is invalid")
+        _validate_correction(record["field_name"], record["corrected_value"], matches[0])
+    _validate_pending_correction_outputs(
+        ledger_root,
+        str(journal["event_id"]),
+        {str(key): str(value) for key, value in payload.items()},
+        {str(key): str(value) for key, value in record.items()},
+    )
 
 
 def recover_pending_correction(ledger_root: Path) -> None:

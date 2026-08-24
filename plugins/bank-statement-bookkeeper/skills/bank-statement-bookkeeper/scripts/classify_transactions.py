@@ -21,6 +21,7 @@ from bookkeeper.classification import (
     load_transactions,
     recover_pending_operation,
     save_transactions,
+    validate_rule_export_destination,
 )
 from bookkeeper.storage import read_audit_events
 from bookkeeper.storage import replace_active_issues
@@ -84,6 +85,8 @@ def main() -> int:
     args = parser.parse_args()
     ledger = Path(args.ledger)
     load_ledger(ledger)
+    if args.command == "export-rules":
+        validate_rule_export_destination(ledger, args.destination)
     recover_ledger_workflow(ledger)
     if args.command == "pending":
         current = _current(ledger)

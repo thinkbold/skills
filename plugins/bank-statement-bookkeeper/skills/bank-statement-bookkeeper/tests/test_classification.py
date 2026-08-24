@@ -69,6 +69,14 @@ class ClassificationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    @staticmethod
+    def ledger_bytes(ledger: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(ledger).as_posix(): path.read_bytes()
+            for path in sorted(ledger.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        }
+
     def test_normalization_removes_terminal_references_but_preserves_words(self) -> None:
         """Catches normalization keeping random terminal references or deleting merchant words."""
         self.assertEqual("OPENAI CHATGPT SUBSCRIPTION", normalize_merchant("OPENAI *CHATGPT SUBSCRIPTION 9F3A2"))
@@ -149,17 +157,197 @@ class ClassificationTests(unittest.TestCase):
         result = confirm_group(no_chart, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "", "Subscriptions", False, "user")
         self.assertEqual({"Subscriptions"}, {item["account_name"] for item in result.transactions})
 
+    def test_chart_name_is_canonical_for_confirmation(self) -> None:
+        """Catches a chart-backed confirmation persisting a caller-supplied alias for an active code."""
+        before = self.ledger_bytes(self.ledger)
+        with self.assertRaisesRegex(ValueError, "account name does not match active chart"):
+            confirm_group(
+                self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+                "outflow", "6100", "Subscriptions", True, "user",
+            )
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
+        confirmed = confirm_group(
+            self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+            "outflow", "6100", "", True, "user",
+        )
+        self.assertEqual({"Membership Fee"}, {item["account_name"] for item in confirmed.transactions})
+        self.assertEqual("Membership Fee", load_rules(self.ledger)[0]["account_name"])
+
+    def test_chart_name_is_canonical_for_correction(self) -> None:
+        """Catches a chart-backed correction persisting a noncanonical name for an active code."""
+        confirmed = confirm_group(
+            self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+            "outflow", "6100", "Membership Fee", True, "user",
+        )
+        before = self.ledger_bytes(self.ledger)
+        with self.assertRaisesRegex(ValueError, "account name does not match active chart"):
+            correct_transactions(
+                self.ledger, confirmed.transactions, ("cad-openai",),
+                "6200", "Technology", "selected", "user",
+            )
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
+        corrected = correct_transactions(
+            self.ledger, confirmed.transactions, ("cad-openai",),
+            "6200", "", "selected", "user",
+        )
+        selected = next(item for item in corrected.transactions if item["transaction_id"] == "cad-openai")
+        self.assertEqual(("6200", "Software"), (selected["account_code"], selected["account_name"]))
+
+    def test_header_only_chart_rejects_confirmation_without_mutation(self) -> None:
+        """Catches an empty supplied chart being mistaken for permission to use a free-form category."""
+        atomic_write_csv(
+            self.ledger / "chart-of-accounts.csv",
+            ("account_code", "account_name", "active"),
+            (),
+        )
+        before = self.ledger_bytes(self.ledger)
+
+        with self.assertRaisesRegex(ValueError, "account code is not active"):
+            confirm_group(
+                self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+                "outflow", "", "Subscriptions", False, "user",
+            )
+
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
+
+    def test_header_only_chart_rejects_correction_without_mutation(self) -> None:
+        """Catches correction bypassing a supplied chart that currently has no active accounts."""
+        atomic_write_csv(
+            self.ledger / "chart-of-accounts.csv",
+            ("account_code", "account_name", "active"),
+            (),
+        )
+        classified = tuple({
+            **item,
+            "classification_status": "classified",
+            "account_name": "Legacy category",
+        } for item in self.openai_rows)
+        before = self.ledger_bytes(self.ledger)
+
+        with self.assertRaisesRegex(ValueError, "account code is not active"):
+            correct_transactions(
+                self.ledger, classified, ("cad-openai",),
+                "", "Subscriptions", "selected", "user",
+            )
+
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
+
     def test_exact_conflict_leaves_row_unclassified_and_scopes_only_after_conflict(self) -> None:
         """Catches ambiguous exact rules silently classifying a transaction or prematurely scoping rules."""
-        rule_a = {field: "" for field in MERCHANT_RULE_FIELDS}
-        rule_a.update({"rule_id": "r-a", "normalized_merchant": "OPENAI CHATGPT SUBSCRIPTION", "direction": "outflow", "account_code": "6100", "account_name": "Membership Fee", "match_type": "exact_normalized", "status": "active"})
-        rule_b = {**rule_a, "rule_id": "r-b", "account_code": "6200", "account_name": "Software"}
-        atomic_write_csv(self.ledger / "merchant-rules.csv", MERCHANT_RULE_FIELDS, (rule_a, rule_b))
+        first = row("first-rule", "checking", "CAD", "OPENAI CHATGPT SUBSCRIPTION A1B2C", "10.00", "2026-01-01")
+        second = row("second-rule", "card", "USD", "OPENAI CHATGPT SUBSCRIPTION D4E5F", "11.00", "2026-01-02")
+        confirm_group(
+            self.ledger, (first,), "OPENAI CHATGPT SUBSCRIPTION", "outflow",
+            "6100", "Membership Fee", True, "user",
+        )
+        confirm_group(
+            self.ledger, (second,), "OPENAI CHATGPT SUBSCRIPTION", "outflow",
+            "6200", "Software", True, "user",
+        )
         result = apply_exact_rules((self.openai_rows[0],), load_rules(self.ledger))
         self.assertEqual("unclassified", result.transactions[0]["classification_status"])
         self.assertEqual("MERCHANT_RULE_CONFLICT", result.issues[0].code)
         corrected = correct_transactions(self.ledger, result.transactions, ("cad-openai",), "6200", "Software", "future_rule", "user")
         self.assertEqual("checking", corrected.created_rules[0]["account_scope"])
+
+    def test_exact_application_rejects_rules_not_loaded_from_a_ledger_audit(self) -> None:
+        """Catches direct callers bypassing rule-audit validation with a copied rule dictionary."""
+        confirm_group(
+            self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+            "outflow", "6100", "Membership Fee", True, "user",
+        )
+        copied_rules = [dict(load_rules(self.ledger)[0])]
+        with self.assertRaisesRegex(ValueError, "audit-authorized"):
+            apply_exact_rules((self.fuzzy_row,), copied_rules)
+
+    def test_rule_loading_rejects_tampered_metadata_and_unrelated_audit_ids(self) -> None:
+        """Catches forged rule rows borrowing an audit ID or changing audit-bound matching/category data."""
+        confirm_group(
+            self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+            "outflow", "6100", "Membership Fee", True, "user",
+        )
+        rules_path = self.ledger / "merchant-rules.csv"
+        original = read_csv_rows(rules_path)[0]
+        unrelated_event_id = next(
+            str(event["event_id"])
+            for event in read_audit_events(self.ledger)
+            if event["event_type"] == "ledger_initialized"
+        )
+        tampered_values = (
+            ("rule_id", "rule-" + "f" * 32),
+            ("normalized_merchant", "FORGED MERCHANT"),
+            ("direction", "inflow"),
+            ("account_scope", "other-account"),
+            ("account_code", "6200"),
+            ("account_name", "Software"),
+            ("status", "pending"),
+            ("audit_event_id", unrelated_event_id),
+        )
+        for field, value in tampered_values:
+            with self.subTest(field=field):
+                forged = dict(original)
+                forged[field] = value
+                atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, (forged,))
+                before = self.ledger_bytes(self.ledger)
+                with self.assertRaisesRegex(ValueError, "merchant rule"):
+                    load_rules(self.ledger)
+                self.assertEqual(before, self.ledger_bytes(self.ledger))
+        atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, (original,))
+
+    def test_public_rule_view_rejects_forged_rule_before_mutation(self) -> None:
+        """Catches a public command accepting an unaudited active rule and publishing classified output."""
+        forged = {field: "" for field in MERCHANT_RULE_FIELDS}
+        forged.update({
+            "rule_id": "rule-" + "a" * 32,
+            "normalized_merchant": "OPENAI CHATGPT SUBSCRIPTION",
+            "direction": "outflow", "account_code": "6100",
+            "account_name": "Membership Fee", "match_type": "exact_normalized",
+            "status": "active", "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z", "audit_event_id": "b" * 32,
+        })
+        atomic_write_csv(self.ledger / "merchant-rules.csv", MERCHANT_RULE_FIELDS, (forged,))
+        atomic_write_csv(
+            self.ledger / "work" / "normalized-transactions.csv",
+            CANONICAL_TRANSACTION_FIELDS, (self.openai_rows[0],),
+        )
+        before = self.ledger_bytes(self.ledger)
+        command = [
+            sys.executable, str(SKILL_ROOT / "scripts" / "classify_transactions.py"),
+            "pending", str(self.ledger),
+        ]
+        rejected = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(3, rejected.returncode)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
+
+    def test_rule_loading_rejects_a_truncated_row_as_schema_invalid(self) -> None:
+        """Catches malformed CSV cells escaping the forged-rule gate as an unexpected type error."""
+        rules_path = self.ledger / "merchant-rules.csv"
+        with rules_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(MERCHANT_RULE_FIELDS)
+            writer.writerow(("rule-" + "0" * 32,))
+
+        with self.assertRaisesRegex(ValueError, "schema"):
+            load_rules(self.ledger)
+
+    def test_rule_lifecycle_and_export_reject_forged_rules_before_mutation(self) -> None:
+        """Catches lifecycle/export paths trusting a rule merely because its audit ID is nonempty."""
+        confirmed = confirm_group(
+            self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION",
+            "outflow", "6100", "Membership Fee", True, "user",
+        )
+        rule_id = confirmed.created_rules[0]["rule_id"]
+        rules_path = self.ledger / "merchant-rules.csv"
+        forged = read_csv_rows(rules_path)[0]
+        forged["normalized_merchant"] = "FORGED MERCHANT"
+        atomic_write_csv(rules_path, MERCHANT_RULE_FIELDS, (forged,))
+        before = self.ledger_bytes(self.ledger)
+        with self.assertRaisesRegex(ValueError, "merchant rule"):
+            deactivate_rule(self.ledger, rule_id, "user")
+        with self.assertRaisesRegex(ValueError, "merchant rule"):
+            export_rules(self.ledger, "outputs/forged-export.csv")
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
 
     def test_fuzzy_suggestion_never_applies_a_rule(self) -> None:
         """Catches a fuzzy ranking path accidentally classifying a real transaction."""
@@ -216,7 +404,9 @@ class ClassificationTests(unittest.TestCase):
         with patch("bookkeeper.classification.append_audit_event", side_effect=OSError("synthetic audit interruption")):
             with self.assertRaisesRegex(OSError, "synthetic audit interruption"):
                 deactivate_rule(self.ledger, rule_id, "user")
-        self.assertEqual("inactive", load_rules(self.ledger)[0]["status"])
+        self.assertEqual("inactive", read_csv_rows(self.ledger / "merchant-rules.csv")[0]["status"])
+        with self.assertRaisesRegex(ValueError, "audit lifecycle"):
+            load_rules(self.ledger)
         self.assertEqual([], [event for event in read_audit_events(self.ledger) if event["event_type"] == "merchant_rule_deactivated"])
         self.assertTrue((self.ledger / "work" / "pending-classification-operation.json").exists())
         recovered = deactivate_rule(self.ledger, rule_id, "user")
@@ -300,10 +490,42 @@ class ClassificationTests(unittest.TestCase):
     def test_export_and_non_pending_outputs_do_not_contain_descriptions(self) -> None:
         """Catches raw statement descriptions escaping through rule export or audit records."""
         confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
-        output = export_rules(self.ledger, "work/exported-rules.csv")
+        output = export_rules(self.ledger, "outputs/exported-rules.csv")
         self.assertTrue(output.is_file())
         self.assertNotIn("9F3A2", output.read_text(encoding="utf-8"))
         self.assertNotIn("9F3A2", str(read_audit_events(self.ledger)))
+
+    def test_rule_export_rejects_authoritative_traversal_and_symlink_destinations(self) -> None:
+        """Catches rule export overwriting authoritative ledger state or following a ledger-local symlink."""
+        confirm_group(self.ledger, self.openai_rows, "OPENAI CHATGPT SUBSCRIPTION", "outflow", "6100", "Membership Fee", True, "user")
+        outside = Path(self.temp.name) / "outside.csv"
+        outside.write_text("outside\n", encoding="utf-8")
+        symlink = self.ledger / "outputs" / "linked.csv"
+        symlink.symlink_to(outside)
+        unsafe = (
+            "ledger.json", "merchant-rules.csv", "work/export.csv",
+            "audit/export.csv", "inputs/export.csv", "outputs/../ledger.json",
+            "outputs/status.json", "outputs/linked.csv",
+        )
+        for destination in unsafe:
+            with self.subTest(destination=destination):
+                before = self.ledger_bytes(self.ledger)
+                with self.assertRaisesRegex(ValueError, "rule export destination"):
+                    export_rules(self.ledger, destination)
+                self.assertEqual(before, self.ledger_bytes(self.ledger))
+        self.assertEqual(b"outside\n", outside.read_bytes())
+
+    def test_public_export_rejects_ledger_json_without_changing_any_bytes(self) -> None:
+        """Catches the CLI overwriting ledger.json before rejecting an unsafe export destination."""
+        before = self.ledger_bytes(self.ledger)
+        command = [
+            sys.executable, str(SKILL_ROOT / "scripts" / "classify_transactions.py"),
+            "export-rules", str(self.ledger), "ledger.json",
+        ]
+        rejected = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(3, rejected.returncode)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", json.loads(rejected.stdout)["error"])
+        self.assertEqual(before, self.ledger_bytes(self.ledger))
 
     def test_pending_cli_shows_review_descriptions_but_rules_cli_does_not(self) -> None:
         """Catches the review command hiding required samples or another command leaking them."""
