@@ -400,7 +400,10 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(expected_id, row["transaction_id"])
         self.assertEqual(logical_source, row["source_file"])
         self.assertEqual("page:2/row:1", row["source_page_or_row"])
-        self.assertEqual("inputs/synthetic.pdf:page:2/row:1", row["source_locations"])
+        self.assertEqual(
+            f"{logical_source}:inputs/synthetic.pdf:page:2/row:1",
+            row["source_locations"],
+        )
         self.assertEqual("SYNTHETIC MERCHANT", row["normalized_merchant"])
         self.assertEqual("unclassified", row["classification_status"])
         self.assertEqual(("", "", "", ""), tuple(row[field] for field in (
@@ -470,6 +473,61 @@ class ConsentTests(unittest.TestCase):
         ]
         self.assertEqual(2, len(imported_events))
 
+    def test_cli_changed_external_result_removes_old_provenance_collapsed_into_local_row(self) -> None:
+        """Catches external replacement leaving its old location on another source's overlap primary."""
+        mapping_path = self.ledger / "work" / "local-map.json"
+        mapping_path.write_text(json.dumps({
+            "transaction_date": "Date", "posting_date": "Posted", "description": "Description",
+            "debit": "Debit", "credit": "Credit", "balance": "Balance", "reference": "Reference",
+            "date_formats": ["%Y-%m-%d"],
+        }), encoding="utf-8")
+        account_path = self.ledger / "work" / "local-account.json"
+        account_path.write_text(json.dumps({
+            "account_id": "checking-001", "institution": "Synthetic Bank",
+            "masked_label": "***1001", "currency": "CAD",
+        }), encoding="utf-8")
+        local = self.ledger / "inputs" / "local-overlap.csv"
+        local.write_text(
+            "Date,Posted,Description,Debit,Credit,Balance,Reference\n"
+            "2026-01-05,2026-01-05,Synthetic merchant,20.00,,980.00,SYN-1\n",
+            encoding="utf-8",
+        )
+        with redirect_stdout(StringIO()):
+            self.assertEqual(0, import_statements.main([
+                "csv", str(self.ledger), "inputs/local-overlap.csv",
+                "--mapping", "work/local-map.json", "--account", "work/local-account.json",
+            ]))
+        consent_id = self._authorize()
+        returned = self._write_result("overlapping-result.csv", {})
+        first_code, _ = self._run_external_result(returned, consent_id)
+        self.assertEqual(0, first_code)
+        old_provider_location = "inputs/synthetic.pdf:page:2/row:1"
+        self.assertIn(
+            old_provider_location,
+            read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")[0]["source_locations"],
+        )
+        self._write_result("overlapping-result.csv", {
+            "raw_description": "Changed synthetic merchant", "reference": "SYN-2", "outflow": "25.00",
+            "source_page_or_row": "page:2/row:2",
+            "source_locations": "inputs/changed.pdf:page:2/row:2",
+        })
+
+        second_code, _ = self._run_external_result(returned, consent_id)
+
+        self.assertEqual(0, second_code)
+        canonical = read_csv_rows(self.ledger / "work" / "normalized-transactions.csv")
+        derived = read_csv_rows(self.ledger / "outputs" / "normalized-transactions.csv")
+        self.assertEqual(2, len(canonical))
+        self.assertEqual(
+            {row["transaction_id"]: row for row in canonical},
+            {row["transaction_id"]: row for row in derived},
+        )
+        local_row = next(row for row in canonical if row["source_file"] == "inputs/local-overlap.csv")
+        external_row = next(row for row in canonical if row["source_file"].startswith("external:"))
+        self.assertEqual("inputs/local-overlap.csv:2", local_row["source_locations"])
+        self.assertIn("inputs/changed.pdf:page:2/row:2", external_row["source_locations"])
+        self.assertNotIn(old_provider_location, "|".join(row["source_locations"] for row in canonical))
+
     def test_cli_same_external_bytes_for_distinct_operations_are_independently_audited(self) -> None:
         """Catches equal returned bytes coalescing two independently authorized operations."""
         first_id = self._authorize()
@@ -519,6 +577,55 @@ class ConsentTests(unittest.TestCase):
                 self.assertEqual(3, return_code)
                 self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
                 self.assertEqual(expected, self._ledger_bytes())
+
+    def test_cli_rejects_a_result_file_symlink_without_ledger_mutation(self) -> None:
+        """Catches resolving an in-ledger returned-file symlink before the lexical safety gate."""
+        consent_id = self._authorize()
+        target = self._write_result("real-result.csv", {})
+        linked = self.ledger / "work" / "linked-result.csv"
+        linked.symlink_to(target.name)
+        expected = self._ledger_bytes()
+
+        return_code, output = self._run_external_result(linked, consent_id)
+
+        self.assertEqual(3, return_code)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+        self.assertEqual(expected, self._ledger_bytes())
+
+    def test_cli_rejects_a_symlinked_result_ancestor_without_ledger_mutation(self) -> None:
+        """Catches traversing an in-ledger symlinked directory to read a returned CSV."""
+        consent_id = self._authorize()
+        real_directory = self.ledger / "work" / "real-results"
+        real_directory.mkdir()
+        target = real_directory / "returned.csv"
+        target.write_bytes((FIXTURES / "external-result.csv").read_bytes())
+        linked_directory = self.ledger / "work" / "linked-results"
+        linked_directory.symlink_to(real_directory.name, target_is_directory=True)
+        expected = self._ledger_bytes()
+
+        return_code, output = self._run_external_result(linked_directory / target.name, consent_id)
+
+        self.assertEqual(3, return_code)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+        self.assertEqual(expected, self._ledger_bytes())
+
+    def test_cli_does_not_normalize_away_a_result_path_symlink_component(self) -> None:
+        """Catches parent traversal erasing a symlink component before the lexical lstat walk."""
+        consent_id = self._authorize()
+        real_directory = self.ledger / "work" / "real-results"
+        real_directory.mkdir()
+        target = real_directory / "returned.csv"
+        target.write_bytes((FIXTURES / "external-result.csv").read_bytes())
+        linked_directory = self.ledger / "work" / "linked-results"
+        linked_directory.symlink_to(real_directory.name, target_is_directory=True)
+        disguised = linked_directory / ".." / real_directory.name / target.name
+        expected = self._ledger_bytes()
+
+        return_code, output = self._run_external_result(disguised, consent_id)
+
+        self.assertEqual(3, return_code)
+        self.assertEqual("LEDGER_SCHEMA_INVALID", output["error"])
+        self.assertEqual(expected, self._ledger_bytes())
 
 
 if __name__ == "__main__":

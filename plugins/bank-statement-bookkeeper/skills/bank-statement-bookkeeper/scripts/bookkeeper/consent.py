@@ -414,6 +414,11 @@ def _local_external_rows(
         row.update({
             "transaction_id": hashlib.sha256(id_basis.encode("utf-8")).hexdigest(),
             "source_file": logical_source,
+            "source_locations": "|".join(
+                f"{logical_source}:{location}"
+                for location in row["source_locations"].split("|")
+                if location
+            ),
             "normalized_merchant": "",
             "classification_status": "unclassified",
             "account_code": "",
