@@ -6,6 +6,8 @@ import unittest
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = SKILL_ROOT.parents[1]
+REPO_ROOT = PLUGIN_ROOT.parents[1]
+MARKETPLACE_PATH = REPO_ROOT / ".agents" / "plugins" / "marketplace.json"
 sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 
@@ -66,6 +68,34 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual("transaction_id", CANONICAL_TRANSACTION_FIELDS[0])
         self.assertEqual("source_locations", CANONICAL_TRANSACTION_FIELDS[-1])
         self.assertEqual(21, len(CANONICAL_TRANSACTION_FIELDS))
+
+    def test_marketplace_resolves_the_local_plugin(self) -> None:
+        marketplace = json.loads(MARKETPLACE_PATH.read_text(encoding="utf-8"))
+        entries = [
+            entry
+            for entry in marketplace["plugins"]
+            if entry.get("name") == "bank-statement-bookkeeper"
+        ]
+
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual(
+            {
+                "source": "local",
+                "path": "./plugins/bank-statement-bookkeeper",
+            },
+            entry["source"],
+        )
+        self.assertEqual(
+            {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+            entry["policy"],
+        )
+        self.assertNotIn("products", entry["policy"])
+        self.assertEqual("Productivity", entry["category"])
+        self.assertEqual(
+            PLUGIN_ROOT.resolve(),
+            (REPO_ROOT / entry["source"]["path"]).resolve(),
+        )
 
     def test_required_paths(self) -> None:
         required = (
