@@ -89,9 +89,10 @@ class PluginLayoutTests(unittest.TestCase):
         marketplace = load_json(MARKETPLACE_PATH)
         self.assertEqual("thinkbold-skills", marketplace["name"])
         self.assertEqual("ThinkBold Skills", marketplace["interface"]["displayName"])
-        self.assertEqual(1, len(marketplace["plugins"]))
+        entries = {entry["name"]: entry for entry in marketplace["plugins"]}
+        self.assertEqual(len(marketplace["plugins"]), len(entries))
 
-        entry = marketplace["plugins"][0]
+        entry = entries[PLUGIN_NAME]
         self.assertEqual(PLUGIN_NAME, entry["name"])
         self.assertEqual(
             {"source": "local", "path": f"./plugins/{PLUGIN_NAME}"},
